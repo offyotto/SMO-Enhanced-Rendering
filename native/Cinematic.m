@@ -38,8 +38,7 @@ static ShaderProgram *program;
 static NSString *directory;
 static dispatch_source_t timer;
 static id<MTLTexture> lastDepth;
-static NSUInteger depthAge;
-static uint64_t frameCount, errorCount, skippedFrames;
+static uint64_t frameCount, errorCount, skippedFrames, missingDepthFrames;
 static double gpuMilliseconds;
 static NSString *lastError = @"none";
 static FILE *logFile;
@@ -133,13 +132,28 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
         [lock lock];
         ShaderProgram *p=program;
         if (!p || !p.enabled || p.failed || !gameAllowed) { [lock unlock]; return; }
-        if (depth) { lastDepth=depth; depthAge=0; } else { depth=lastDepth; depthAge++; }
-        if (!depth) { [lock unlock]; return; }
+
+        // Do not drive SSR/AO from old geometry. The previous implementation
+        // reused the last depth texture for up to seven missing presents, which
+        // pairs current color with stale geometry and looks exactly like motion
+        // ghosting during camera movement. We still bind the last texture so the
+        // Metal pipeline remains valid, but depthAvailable=0 disables all
+        // depth-driven effects on frames where the bridge did not provide fresh
+        // depth. Bloom and color grading can continue normally.
+        BOOL freshDepth=(depth != nil);
+        if (freshDepth) {
+            lastDepth=depth;
+        } else {
+            missingDepthFrames++;
+            depth=lastDepth;
+        }
+        if (!depth) { skippedFrames++; [lock unlock]; return; }
+
         ShaderSettings settings=p.settings;
         settings.texel=(simd_float2){1.f/color.width,1.f/color.height};
         settings.depthTexel=(simd_float2){1.f/depth.width,1.f/depth.height};
         settings.aspect=(float)depth.width/depth.height;
-        settings.depthAvailable=depthAge<8 ? 1:0;
+        settings.depthAvailable=freshDepth ? 1.f : 0.f;
         NSUInteger ew=MIN(p.effectWidth,depth.width), eh=MAX(1,(NSUInteger)round(ew/settings.aspect));
         NSUInteger bw=MAX(1,ew/2), bh=MAX(1,eh/2);
         ShaderFrame *frame=nil;
@@ -175,7 +189,7 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
             double ms=(done.GPUEndTime-done.GPUStartTime)*1000;
             gpuMilliseconds=frameCount==1 ? ms : gpuMilliseconds*.95+ms*.05;
             if (done.error) { errorCount++; p.failed=YES; lastError=done.error.description; Log(lastError); }
-            if (frameCount==1 || frameCount%1800==0) Log([NSString stringWithFormat:@"frames=%llu gpuMs=%.3f errors=%llu skipped=%llu",frameCount,gpuMilliseconds,errorCount,skippedFrames]);
+            if (frameCount==1 || frameCount%1800==0) Log([NSString stringWithFormat:@"frames=%llu gpuMs=%.3f errors=%llu skipped=%llu missingDepth=%llu",frameCount,gpuMilliseconds,errorCount,skippedFrames,missingDepthFrames]);
             [lock unlock];
         }];
     }
@@ -184,7 +198,7 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
 __attribute__((visibility("default"))) const char *SMOShadersStatus(void) {
     static char status[2048];
     [lock lock];
-    snprintf(status,sizeof(status),"enabled=%d frames=%llu gpuMs=%.3f errors=%llu skipped=%llu lastError=%s",program.enabled && !program.failed && gameAllowed,frameCount,gpuMilliseconds,errorCount,skippedFrames,lastError.UTF8String);
+    snprintf(status,sizeof(status),"enabled=%d frames=%llu gpuMs=%.3f errors=%llu skipped=%llu missingDepth=%llu lastError=%s",program.enabled && !program.failed && gameAllowed,frameCount,gpuMilliseconds,errorCount,skippedFrames,missingDepthFrames,lastError.UTF8String);
     [lock unlock];
     return status;
 }
