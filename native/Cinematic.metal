@@ -48,6 +48,15 @@ float2 project(float3 p,constant Settings &s) {
 bool validUV(float2 uv) {
     return all(uv>float2(.002))&&all(uv<float2(.998));
 }
+float farDepthTrust(float rawDepth) {
+    // zValue() is proportional to 1/(1-depth). Near the far end of a
+    // perspective depth buffer tiny depth changes therefore become enormous
+    // pseudo-view-space distances. Do not let those unstable values create
+    // kilometre-long SSR rays, huge AO radii, or giant hit-thickness windows.
+    // The fade starts late enough that nearby/mid-range floors and water retain
+    // their full reflection energy.
+    return 1-smoothstep(.9960,.99935,rawDepth);
+}
 GeometryInfo geometryAt(depth2d<float> depth,float2 uv,float3 p,constant Settings &s) {
     float2 dx=float2(s.depthTexel.x*2,0),dy=float2(0,s.depthTexel.y*2);
     float3 left=positionAt(depth,clamp(uv-dx,.001,.999),s);
@@ -112,7 +121,7 @@ float3 filteredReflection(texture2d<float> color,depth2d<float> depth,
                           constant Settings &s) {
     float radius=mix(1.0,7.0,roughness*roughness)*(1+min(travelRatio,3.0)*.18);
     float2 ox=float2(s.texel.x*radius,0),oy=float2(0,s.texel.y*radius);
-    float tolerance=max(.08,hitZ*(.012+.010*roughness));
+    float tolerance=max(.08,min(hitZ,512.0)*(.012+.010*roughness));
 
     float3 sum=max(color.sample(linearSampler,hitUV).rgb,0.0)*.36;
     float weight=.36;
@@ -137,10 +146,6 @@ float3 fireflyClamp(float3 reflection,float3 base) {
     return reflection*min(1.0,limit/max(reflectedLuma,.0001));
 }
 float sourceDistanceConfidence(GeometryInfo hitGeometry,float travelRatio,float pixelTravel,float roughness) {
-    // Do not suppress the receiver surface. The ugly character cases happen when
-    // a long SSR ray resolves to small/curved/discontinuous source geometry.
-    // Nearby character reflections remain possible; only increasingly long,
-    // unstable source hits are attenuated.
     float stable=smoothstep(.10,.70,hitGeometry.continuity);
     float planar=1-smoothstep(.28,.88,hitGeometry.curvature);
     float sourceGeometry=mix(.42,1.0,stable*mix(.68,1.0,planar));
@@ -161,11 +166,13 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     float3 p=positionAt(depth,uv,s);
     GeometryInfo geometry=geometryAt(depth,uv,p,s);
     float3 n=geometry.normal;
+    float farTrust=farDepthTrust(rawDepth);
+    float traceZ=min(p.z,512.0);
     float jitter=fract(52.9829189*fract(dot(floor(in.position.xy),float2(.06711056,.00583715))));
 
     float ao=0;
     float3 bounce=0;
-    float radius=p.z*.10;
+    float radius=traceZ*.10;
     for (uint i=0;i<12;++i) {
         float angle=float(i)*2.39996323;
         float scale=sqrt((float(i)+.5)/12.0);
@@ -179,29 +186,30 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
         bounce+=max(color.sample(linearSampler,sampleUV).rgb,0.0)*weight;
     }
     ao=clamp(1-ao*(s.occlusion/4.0),.58,1.0);
-    bounce*=.035;
+    ao=mix(1.0,ao,farTrust);
+    bounce*=.035*farTrust;
 
     MaterialInfo materialInfo=classifyMaterial(base,geometry);
     float3 view=normalize(p);
     float3 ray=reflect(view,n);
     float fresnel=.20+.80*pow(1-clamp(dot(n,-view),0.0,1.0),4.0);
     float roughEnergy=mix(1.0,.72,materialInfo.roughness);
-    float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy;
+    float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy*farTrust;
 
     float3 reflection=0;
     float confidence=0;
     if (reflectivity>.010&&geometry.continuity>.04) {
-        float3 origin=p+n*(p.z*(.0012+.0010*(1-geometry.continuity)));
-        float maxDistance=p.z*mix(4.1,2.55,materialInfo.roughness);
-        float previousDistance=max(p.z*.008,.015);
+        float3 origin=p+n*(traceZ*(.0012+.0010*(1-geometry.continuity)));
+        float maxDistance=traceZ*mix(4.1,2.55,materialInfo.roughness);
+        float previousDistance=max(traceZ*.008,.015);
         float3 previousP=origin+ray*previousDistance;
         float2 previousUV=project(previousP,s);
         float previousDelta=-1;
         if (previousP.z>.1&&validUV(previousUV)) previousDelta=previousP.z-zValue(depth,previousUV);
 
         for (uint step=0;step<48;++step) {
-            float scheduled=p.z*.020*exp2((float(step)+jitter)*.145);
-            float distance=max(scheduled,previousDistance+max(p.z*.001,.01));
+            float scheduled=traceZ*.020*exp2((float(step)+jitter)*.145);
+            float distance=max(scheduled,previousDistance+max(traceZ*.001,.01));
             if (distance>maxDistance) distance=maxDistance;
 
             float3 sampleP=origin+ray*distance;
@@ -242,7 +250,8 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
                         float3 hitP=positionAt(depth,hitUV,s);
                         float hitZ=hitP.z;
                         float hitGap=max(hitRayP.z-hitZ,0.0);
-                        float hitThickness=max(.08,hitZ*(.012+.010*materialInfo.roughness));
+                        float hitMetricZ=min(hitZ,512.0);
+                        float hitThickness=max(.08,hitMetricZ*(.012+.010*materialInfo.roughness));
                         float valid=1-smoothstep(hitThickness*.35,hitThickness*1.8,hitGap);
 
                         GeometryInfo hitGeometry=geometryAt(depth,hitUV,hitP,s);
@@ -250,10 +259,11 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
                         float edge=smoothstep(0.0,.085,min(min(hitUV.x,hitUV.y),min(1-hitUV.x,1-hitUV.y)));
                         float pixelSeparation=length((hitUV-uv)/max(s.depthTexel,float2(1e-6)));
                         float separation=smoothstep(2.5,11.0,pixelSeparation);
-                        float travelRatio=hitDistance/max(p.z,.1);
+                        float travelRatio=hitDistance/max(traceZ,.1);
                         float distanceFade=1-smoothstep(.78,.99,hitDistance/max(maxDistance,.001));
                         float sourceTrust=sourceDistanceConfidence(hitGeometry,travelRatio,pixelSeparation,materialInfo.roughness);
-                        float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*geometry.continuity*hitGeometry.continuity*sourceTrust;
+                        float hitFarTrust=farDepthTrust(hitRaw);
+                        float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*geometry.continuity*hitGeometry.continuity*sourceTrust*hitFarTrust;
 
                         if (candidate>.020) {
                             confidence=candidate;
@@ -277,7 +287,7 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     float strength=min(reflectivity*confidence,.72)*(1-.72*darkening);
     float3 addition=(reflection-base)*strength+bounce;
 
-    if (s.debugView>2.5) return float4(float3(confidence*materialInfo.weight),1);
+    if (s.debugView>2.5) return float4(float3(confidence*materialInfo.weight*farTrust),1);
     if (s.debugView>1.5) return float4(n*.5+.5,1);
     if (s.debugView>.5) return float4(float3(log2(p.z)/12),1);
     return float4(addition*mask,mix(1.0,ao,mask));
@@ -313,7 +323,10 @@ fragment float4 composite(VertexOut in [[stage_in]],texture2d<float> original [[
     float3 c=max(raw*fx.a+fx.rgb,0.0);
     float rawL=luminance(raw);
     float highlightProtect=1-smoothstep(.65,1.55,rawL);
-    float bloomProtect=1-.75*smoothstep(.85,2.25,rawL);
+    // Once the game's own HDR output is already bright, adding our blurred
+    // bloom back on top only destroys waterfall/cloud detail. Fade it fully
+    // rather than retaining the old 25% floor.
+    float bloomProtect=1-smoothstep(.80,1.55,rawL);
     c+=bloomTex.sample(linearSampler,in.uv).rgb*s.bloom*bloomProtect;
 
     float mask=sceneMask(in.uv);
