@@ -16,6 +16,8 @@ struct Settings {
     float debugView;
     float depthAvailable;
     float2 direction;
+    float debugMip;
+    float hierarchyLevels;
 };
 struct GeometryInfo {
     float3 normal;
@@ -26,6 +28,36 @@ struct MaterialInfo {
     float weight;
     float roughness;
 };
+struct SurfaceOutput {
+    float4 effects [[color(0)]];     // Bounce RGB, AO alpha.
+    float4 reflection [[color(1)]];  // Radiance times weight RGB, composite weight alpha.
+};
+
+// Capture evidence: Depth32Float clears to 1. Larger values are farther away.
+// R32Float minima retain depth precision near 1 and need half the bandwidth
+// of min/max pairs. A ray behind a minimum must descend, never skip that cell.
+// These kernels use distinct mip views. Each encoder ends before the next mip.
+kernel void depthHierarchyCopy(depth2d<float,access::read> depth [[texture(0)]],
+    texture2d<float,access::write> target [[texture(1)]], uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid>=uint2(target.get_width(),target.get_height()))) return;
+    float d=depth.read(tid);
+    target.write(float4(isfinite(d)&&d>.001&&d<.99998 ? d : 1.0),tid);
+}
+kernel void depthHierarchyReduce(texture2d<float,access::read> source [[texture(0)]],
+    texture2d<float,access::write> target [[texture(1)]], uint2 tid [[thread_position_in_grid]]) {
+    uint2 dstSize=uint2(target.get_width(),target.get_height());
+    if (any(tid>=dstSize)) return;
+    uint2 srcSize=uint2(source.get_width(),source.get_height());
+    // Native odd mip sizes round down. Cover every overlapping source texel
+    // in normalized coordinates, including the last row and column (up to 3x3).
+    uint2 first=tid*srcSize/dstSize;
+    uint2 end=((tid+1)*srcSize+dstSize-1)/dstSize;
+    float closest=1.0;
+    for (uint y=first.y;y<end.y;++y)
+        for (uint x=first.x;x<end.x;++x)
+            closest=min(closest,source.read(uint2(x,y)).r);
+    target.write(float4(closest),tid);
+}
 
 constexpr sampler linearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
 constexpr sampler depthSampler(coord::normalized, address::clamp_to_edge, filter::nearest);
@@ -172,22 +204,224 @@ float3 clampIndirectSample(float3 c) {
     return c*min(1.0,2.25/max(l,.0001));
 }
 
-fragment float4 surfaceEffects(VertexOut in [[stage_in]],
-    texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],
-    constant Settings &s [[buffer(0)]]) {
-    float2 uv=in.uv;
-    float rawDepth=depth.sample(depthSampler,uv);
-    if (s.depthAvailable<.5||rawDepth>.99998||rawDepth<.001) return float4(0,0,0,1);
+enum TraceReason : uint {
+    TraceMiss=0, TraceHit=1, TraceRejected=2, TraceEdge=3, TraceDepth=4,
+    TraceMaterial=5, TraceBudget=6, TraceGeometry=7, TraceHDR=8, TraceUnavailable=9
+};
+struct ReflectionResult {
+    float3 radiance;
+    float confidence;
+    uint lookups;
+    uint fineLookups;
+    uint candidates;
+    uint reason;
+};
+struct ProjectedRay {
+    float3 start;
+    float3 delta;
+    float end;
+    float epsilon;
+    uint endReason;
+};
+float3 positionWithZ(float2 uv,float z,constant Settings &s) {
+    return float3((uv.x*2-1)*s.aspect*s.tanHalfFov,(1-uv.y*2)*s.tanHalfFov,1)*z;
+}
+bool makeProjectedRay(float3 origin,float3 direction,float firstDistance,float maxDistance,
+                      constant Settings &s,thread ProjectedRay &r) {
+    r.endReason=TraceMiss;
+    float endDistance=maxDistance;
+    // The reconstruction model has near Z=1. Clip before projection, including
+    // rays toward the camera. Neither a negative Z direction nor a grazing
+    // normal alone excludes a receiver.
+    if (direction.z<0) {
+        float nearDistance=(origin.z-1.0001)/(-direction.z);
+        if (nearDistance<endDistance) { endDistance=nearDistance; r.endReason=TraceDepth; }
+    }
+    if (endDistance<=firstDistance) return false;
+    float3 a=origin+direction*firstDistance,b=origin+direction*endDistance;
+    r.start=float3(project(a,s),1-1/a.z);
+    r.delta=float3(project(b,s),1-1/b.z)-r.start;
+    if (!all(isfinite(r.start))||!all(isfinite(r.delta))) return false;
+    if (!validUV(r.start.xy)) { r.endReason=TraceEdge; return false; }
+    r.end=1;
+    for (uint axis=0;axis<2;++axis) {
+        float d=r.delta[axis];
+        if (abs(d)<1e-10) continue;
+        float boundary=d>0 ? .998 : .002;
+        float exit=(boundary-r.start[axis])/d;
+        if (exit<r.end) { r.end=max(exit,0.0); r.endReason=TraceEdge; }
+    }
+    float pixelLength=max(abs(r.delta.x)/s.depthTexel.x,abs(r.delta.y)/s.depthTexel.y);
+    // Move 0.005 native depth pixels across cell boundaries. A separate
+    // lower bound guarantees progress for a ray with almost no screen motion.
+    r.epsilon=max(1e-7,.005/max(pixelLength,1.0));
+    return r.end>0;
+}
+float cellExit(ProjectedRay r,uint2 cell,uint2 size,float t) {
+    float exit=r.end;
+    for (uint axis=0;axis<2;++axis) {
+        float d=r.delta[axis];
+        if (abs(d)<1e-10) continue;
+        float boundary=float(cell[axis]+uint(d>0))/float(size[axis]);
+        exit=min(exit,(boundary-r.start[axis])/d);
+    }
+    return max(exit,t);
+}
 
+// Geometry and material acquisition stay outside this function. True G-buffer
+// inputs and stochastic directions can replace their estimates later. The
+// result contains current-frame radiance only. It has no temporal history.
+ReflectionResult traceReflection(texture2d<float> color,depth2d<float> depth,
+    texture2d<float,access::read> hierarchy,float2 uv,float3 p,GeometryInfo geometry,
+    MaterialInfo material,float3 base,float reflectivity,constant Settings &s) {
+    ReflectionResult result={float3(0),0,0,0,0,TraceMiss};
+    float raw=1-1/p.z;
+    if (farDepthTrust(raw)<.01) { result.reason=TraceDepth; return result; }
+    if (hdrSurfaceTrust(base)<.01) { result.reason=TraceHDR; return result; }
+    if (reflectivity<=.010) { result.reason=TraceMaterial; return result; }
+    if (geometry.continuity<=.04) { result.reason=TraceGeometry; return result; }
+
+    float traceZ=min(p.z,512.0);
+    float3 direction=reflect(normalize(p),geometry.normal);
+    float3 origin=p+geometry.normal*(traceZ*(.0012+.0010*(1-geometry.continuity)));
+    float maxDistance=traceZ*mix(4.1,2.55,material.roughness);
+    ProjectedRay ray;
+    if (!makeProjectedRay(origin,direction,max(traceZ*.008,.015),maxDistance,s,ray)) {
+        result.reason=ray.endReason==TraceEdge ? TraceEdge : TraceDepth;
+        return result;
+    }
+
+    int maxMip=max(0,int(s.hierarchyLevels)-1);
+    int mip=min(maxMip,material.roughness<.25 ? 0 : (material.roughness<.6 ? 1 : 2));
+    uint budget=uint(mix(64.0,40.0,material.roughness));
+    uint candidateBudget=material.roughness<.25 ? 6 : (material.roughness<.6 ? 4 : 2);
+    float t=0;
+    for (uint step=0;step<budget && t<ray.end;++step) {
+        uint2 size=uint2(hierarchy.get_width(uint(mip)),hierarchy.get_height(uint(mip)));
+        float2 cellUV=ray.start.xy+ray.delta.xy*min(t+ray.epsilon,ray.end);
+        uint2 cell=min(uint2(clamp(cellUV,0.0,1.0)*float2(size)),size-1);
+        float exit=cellExit(ray,cell,size,t);
+        float closest=hierarchy.read(cell,uint(mip)).r;
+        result.lookups++;
+        if (mip==0) result.fineLookups++;
+        float entryDepth=ray.start.z+ray.delta.z*t;
+        float exitDepth=ray.start.z+ray.delta.z*exit;
+
+        // Both signs of depth slope use the complete cell interval. Only a
+        // ray wholly in front of the closest surface can skip this region.
+        if (closest>=1 || max(entryDepth,exitDepth)<closest) {
+            t=exit+ray.epsilon;
+            mip=min(mip+1,maxMip);
+            continue;
+        }
+        if (mip>0) {
+            if (entryDepth<closest && ray.delta.z>1e-10)
+                t=max(t,min(exit,(closest-ray.start.z)/ray.delta.z));
+            mip--;
+            continue;
+        }
+
+        // Mip 0 is a constant nearest-sampled depth plane within this texel.
+        // Solve its intersection analytically in projected depth. Linear
+        // view-space Z or binary samples across texel boundaries are incorrect.
+        float leafEnd=max(t,exit-ray.epsilon*.5);
+        float hitT=t;
+        if (abs(ray.delta.z)>1e-10) {
+            float planeT=(closest-ray.start.z)/ray.delta.z;
+            hitT=ray.delta.z>0 ? max(t,planeT) : min(leafEnd,planeT);
+        }
+        float hitZ=1/max(1-closest,.00002);
+        float thickness=max(.08,min(hitZ,512.0)*(.012+.010*material.roughness));
+        float hitRaw=ray.start.z+ray.delta.z*hitT;
+        float hitRayZ=1/max(1-hitRaw,.00002);
+        float gap=hitRayZ-hitZ;
+        if (hitT>=t && hitT<=leafEnd && gap>=-hitZ*1e-5 && gap<thickness*1.8) {
+            result.candidates++;
+            float2 hitUV=ray.start.xy+ray.delta.xy*hitT;
+            float3 hitP=positionWithZ(hitUV,hitZ,s);
+            float3 hitRayP=positionWithZ(hitUV,hitRayZ,s);
+            float hitDistance=max(0.0,dot(hitRayP-origin,direction));
+            float hitFarTrust=farDepthTrust(closest);
+            float3 hitColor=max(color.sample(linearSampler,hitUV).rgb,0.0);
+            float hitHdrTrust=hdrSurfaceTrust(hitColor);
+            float pixelSeparation=length((hitUV-uv)/s.depthTexel);
+            float separation=smoothstep(2.5,11.0,pixelSeparation);
+            float edge=smoothstep(0.0,.085,min(min(hitUV.x,hitUV.y),min(1-hitUV.x,1-hitUV.y)));
+            float travelRatio=hitDistance/max(traceZ,.1);
+            float distanceFade=1-smoothstep(.78,.99,hitDistance/maxDistance);
+            float valid=1-smoothstep(thickness*.35,thickness*1.8,max(gap,0.0));
+            // Keep source reach constant in screen space when guest depth
+            // changes from 1600 to 3200 pixels. This is not a distance cut.
+            float referencePixels=length((hitUV-uv)*float2(1600,1600/s.aspect));
+            GeometryInfo hitGeometry=geometryAt(depth,hitUV,hitP,s);
+            float frontFace=smoothstep(.02,.28,dot(hitGeometry.normal,-direction));
+            float sourceTrust=sourceDistanceConfidence(hitGeometry,travelRatio,referencePixels,material.roughness);
+            float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*
+                geometry.continuity*hitGeometry.continuity*sourceTrust*hitFarTrust*hitHdrTrust;
+            if (candidate>.020) {
+                result.confidence=candidate;
+                result.radiance=fireflyClamp(filteredReflection(color,depth,hitUV,hitZ,material.roughness,travelRatio,s),base);
+                result.reason=TraceHit;
+                return result;
+            }
+            result.reason=hitFarTrust<.01 ? TraceDepth : (hitHdrTrust<.01 ? TraceHDR : TraceRejected);
+            if (result.candidates>=candidateBudget) return result;
+        }
+        // A leaf that lies entirely behind its finite thickness is not a hit.
+        // Move past this leaf before ascent, including after source rejection.
+        t=exit+ray.epsilon;
+        mip=min(1,maxMip);
+    }
+    if (result.reason==TraceMiss) result.reason=t>=ray.end ? ray.endReason : TraceBudget;
+    return result;
+}
+float3 traceReasonColor(uint reason) {
+    switch (reason) {
+        case TraceHit: return float3(0,1,0);
+        case TraceRejected: return float3(1,.08,.03);
+        case TraceEdge: return float3(0,.5,1);
+        case TraceDepth: return float3(.65,.1,1);
+        case TraceMaterial: return float3(1,.7,0);
+        case TraceBudget: return float3(1,0,.6);
+        case TraceGeometry: return float3(.45,.2,.05);
+        case TraceHDR: return float3(0,1,1);
+        case TraceUnavailable: return float3(.5);
+        default: return float3(0);
+    }
+}
+
+fragment SurfaceOutput surfaceEffects(VertexOut in [[stage_in]],
+    texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],
+    texture2d<float,access::read> hierarchy [[texture(2)]],constant Settings &s [[buffer(0)]]) {
+    float2 uv=in.uv;
+    SurfaceOutput output={float4(0,0,0,1),float4(0)};
+    uint debug=uint(s.debugView+.5);
+    // Check freshness before any depth or hierarchy access.
+    if (s.depthAvailable<.5 || s.hierarchyLevels<1) {
+        if (debug==8) output.effects=float4(traceReasonColor(TraceUnavailable),1);
+        return output;
+    }
+    float rawDepth=depth.sample(depthSampler,uv);
+    if (debug==4) { output.effects=float4(float3(rawDepth),1); return output; }
+    if (debug==5) {
+        uint mip=min(uint(s.debugMip),uint(s.hierarchyLevels)-1);
+        uint2 size=uint2(hierarchy.get_width(mip),hierarchy.get_height(mip));
+        float d=hierarchy.read(min(uint2(uv*float2(size)),size-1),mip).r;
+        output.effects=float4(float3(d>=1 ? 1 : log2(1/max(1-d,.00002))/12),1);
+        return output;
+    }
+    if (!isfinite(rawDepth)||rawDepth>.99998||rawDepth<.001) {
+        if (debug==8) output.effects=float4(traceReasonColor(TraceDepth),1);
+        return output;
+    }
     float3 base=max(color.sample(linearSampler,uv).rgb,0.0);
-    float3 p=positionAt(depth,uv,s);
+    float3 p=positionWithZ(uv,1/max(1-rawDepth,.00002),s);
     GeometryInfo geometry=geometryAt(depth,uv,p,s);
     float3 n=geometry.normal;
     float farTrust=farDepthTrust(rawDepth);
     float hdrTrust=hdrSurfaceTrust(base);
     float surfaceTrust=farTrust*hdrTrust;
     float traceZ=min(p.z,512.0);
-    float jitter=fract(52.9829189*fract(dot(floor(in.position.xy),float2(.06711056,.00583715))));
 
     float ao=0;
     float3 bounce=0;
@@ -213,107 +447,29 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
 
     MaterialInfo materialInfo=classifyMaterial(base,geometry);
     float3 view=normalize(p);
-    float3 ray=reflect(view,n);
     float fresnel=.20+.80*pow(1-clamp(dot(n,-view),0.0,1.0),4.0);
     float roughEnergy=mix(1.0,.72,materialInfo.roughness);
     float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy*surfaceTrust;
 
-    float3 reflection=0;
-    float confidence=0;
-    if (reflectivity>.010&&geometry.continuity>.04) {
-        float3 origin=p+n*(traceZ*(.0012+.0010*(1-geometry.continuity)));
-        float maxDistance=traceZ*mix(4.1,2.55,materialInfo.roughness);
-        float previousDistance=max(traceZ*.008,.015);
-        float3 previousP=origin+ray*previousDistance;
-        float2 previousUV=project(previousP,s);
-        float previousDelta=-1;
-        if (previousP.z>.1&&validUV(previousUV)) previousDelta=previousP.z-zValue(depth,previousUV);
-
-        for (uint step=0;step<48;++step) {
-            float scheduled=traceZ*.020*exp2((float(step)+jitter)*.145);
-            float distance=max(scheduled,previousDistance+max(traceZ*.001,.01));
-            if (distance>maxDistance) distance=maxDistance;
-
-            float3 sampleP=origin+ray*distance;
-            if (sampleP.z<.1) break;
-            float2 sampleUV=project(sampleP,s);
-            if (!validUV(sampleUV)) break;
-
-            float targetPixels=mix(1.30,2.65,materialInfo.roughness);
-            float pixelAdvance=length((sampleUV-previousUV)/max(s.depthTexel,float2(1e-6)));
-            if (pixelAdvance<targetPixels&&distance<maxDistance) {
-                float scale=min(targetPixels/max(pixelAdvance,.05),3.5);
-                distance=min(maxDistance,previousDistance+(distance-previousDistance)*scale);
-                sampleP=origin+ray*distance;
-                if (sampleP.z<.1) break;
-                sampleUV=project(sampleP,s);
-                if (!validUV(sampleUV)) break;
-            }
-
-            float surfaceZ=zValue(depth,sampleUV);
-            float delta=sampleP.z-surfaceZ;
-            if (delta>0&&previousDelta<=0) {
-                float lo=previousDistance,hi=distance;
-                for (uint refine=0;refine<5;++refine) {
-                    float mid=(lo+hi)*.5;
-                    float3 testP=origin+ray*mid;
-                    float2 testUV=project(testP,s);
-                    if (!validUV(testUV)) { hi=mid; continue; }
-                    float testDelta=testP.z-zValue(depth,testUV);
-                    if (testDelta>0) hi=mid; else lo=mid;
-                }
-
-                float hitDistance=(lo+hi)*.5;
-                float3 hitRayP=origin+ray*hitDistance;
-                float2 hitUV=project(hitRayP,s);
-                if (validUV(hitUV)) {
-                    float hitRaw=depth.sample(depthSampler,hitUV);
-                    if (hitRaw>.001&&hitRaw<.99998) {
-                        float3 hitP=positionAt(depth,hitUV,s);
-                        float hitZ=hitP.z;
-                        float hitGap=max(hitRayP.z-hitZ,0.0);
-                        float hitMetricZ=min(hitZ,512.0);
-                        float hitThickness=max(.08,hitMetricZ*(.012+.010*materialInfo.roughness));
-                        float valid=1-smoothstep(hitThickness*.35,hitThickness*1.8,hitGap);
-
-                        GeometryInfo hitGeometry=geometryAt(depth,hitUV,hitP,s);
-                        float frontFace=smoothstep(.02,.28,dot(hitGeometry.normal,-ray));
-                        float edge=smoothstep(0.0,.085,min(min(hitUV.x,hitUV.y),min(1-hitUV.x,1-hitUV.y)));
-                        float pixelSeparation=length((hitUV-uv)/max(s.depthTexel,float2(1e-6)));
-                        float separation=smoothstep(2.5,11.0,pixelSeparation);
-                        float travelRatio=hitDistance/max(traceZ,.1);
-                        float distanceFade=1-smoothstep(.78,.99,hitDistance/max(maxDistance,.001));
-                        float sourceTrust=sourceDistanceConfidence(hitGeometry,travelRatio,pixelSeparation,materialInfo.roughness);
-                        float hitFarTrust=farDepthTrust(hitRaw);
-                        float hitHdrTrust=hdrSurfaceTrust(max(color.sample(linearSampler,hitUV).rgb,0.0));
-                        float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*geometry.continuity*hitGeometry.continuity*sourceTrust*hitFarTrust*hitHdrTrust;
-
-                        if (candidate>.020) {
-                            confidence=candidate;
-                            reflection=filteredReflection(color,depth,hitUV,hitZ,materialInfo.roughness,travelRatio,s);
-                            reflection=fireflyClamp(reflection,base);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            previousDelta=delta;
-            previousDistance=distance;
-            previousUV=sampleUV;
-            if (distance>=maxDistance) break;
-        }
-    }
-
+    ReflectionResult hit=traceReflection(color,depth,hierarchy,uv,p,geometry,materialInfo,base,reflectivity,s);
     float mask=sceneMask(uv);
-    float darkening=smoothstep(0.0,.25,luminance(base)-luminance(reflection));
-    float strength=min(reflectivity*confidence,.72)*(1-.72*darkening);
-    float3 addition=(reflection-base)*strength+bounce;
+    float darkening=smoothstep(0.0,.25,luminance(base)-luminance(hit.radiance));
+    float strength=min(reflectivity*hit.confidence,.72)*(1-.72*darkening);
+    output.effects=float4(bounce*mask,mix(1.0,ao,mask));
+    // Premultiply before the full-resolution pass filters this texture.
+    // Separate RGB/alpha interpolation would attenuate hit boundaries twice.
+    output.reflection=float4(hit.radiance*strength*mask,strength*mask);
 
-    if (s.debugView>2.5) return float4(float3(confidence*materialInfo.weight*surfaceTrust),1);
-    if (s.debugView>1.5) return float4(n*.5+.5,1);
-    if (s.debugView>.5) return float4(float3(log2(p.z)/12),1);
-    return float4(addition*mask,mix(1.0,ao,mask));
+    if (debug==1) output.effects=float4(float3(log2(p.z)/12),1);
+    if (debug==2) output.effects=float4(n*.5+.5,1);
+    if (debug==3) output.effects=float4(float3(hit.confidence),1);
+    // Fixed scales permit comparisons across roughness and scenes. Red is all
+    // hierarchy reads / 64, green is mip-0 reads / 64, blue is candidates / 8.
+    if (debug==6) output.effects=float4(float3(hit.lookups/64.0,hit.fineLookups/64.0,hit.candidates/8.0),1);
+    if (debug==7) output.effects=float4(hit.radiance,1);
+    if (debug==8) output.effects=float4(traceReasonColor(hit.reason),1);
+    if (debug==9) output.effects=float4(materialInfo.weight,materialInfo.roughness,surfaceTrust,1);
+    return output;
 }
 
 fragment float4 bloomExtract(VertexOut in [[stage_in]],texture2d<float> color [[texture(0)]],constant Settings &s [[buffer(0)]]) {
@@ -338,12 +494,14 @@ fragment float4 bloomBlur(VertexOut in [[stage_in]],texture2d<float> color [[tex
     return float4(c,1);
 }
 fragment float4 composite(VertexOut in [[stage_in]],texture2d<float> original [[texture(0)]],
-    texture2d<float> effects [[texture(1)]],texture2d<float> bloomTex [[texture(2)]],constant Settings &s [[buffer(0)]]) {
+    texture2d<float> effects [[texture(1)]],texture2d<float> bloomTex [[texture(2)]],
+    texture2d<float> reflectionTex [[texture(3)]],constant Settings &s [[buffer(0)]]) {
     float3 raw=max(original.sample(linearSampler,in.uv).rgb,0.0);
     float4 fx=effects.sample(linearSampler,in.uv);
     if (s.debugView>.5) return float4(fx.rgb,1);
 
-    float3 c=max(raw*fx.a+fx.rgb,0.0);
+    float4 reflection=reflectionTex.sample(linearSampler,in.uv);
+    float3 c=max(raw*fx.a+fx.rgb+reflection.rgb-raw*reflection.a,0.0);
     float rawL=luminance(raw);
     float highlightProtect=1-smoothstep(.65,1.55,rawL);
     // Once the game's own HDR output is already bright, adding our blurred
