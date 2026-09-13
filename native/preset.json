@@ -8,5 +8,6 @@
   "contrast": 1.055,
   "verticalFov": 50.0,
   "effectWidth": 1280,
-  "debugView": 0
+  "debugView": 0,
+  "debugMip": 0
 }
