@@ -1,0 +1,17 @@
+.DS_Store
+.delta/
+
+*.nsp
+*.xci
+*.nca
+*.keys
+
+*.dylib
+*.metallib
+*.spv
+
+*.rgba16f
+*.r32f
+
+functions.data
+libraries.data

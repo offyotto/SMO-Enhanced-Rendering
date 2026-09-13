@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "reflections": 1.65,
+  "occlusion": 1.55,
+  "bloom": 0.26,
+  "exposure": 1.07,
+  "saturation": 1.10,
+  "contrast": 1.055,
+  "verticalFov": 50.0,
+  "effectWidth": 1280,
+  "debugView": 0
+}

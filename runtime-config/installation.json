@@ -1,0 +1,12 @@
+{
+  "appVersion": "1.0.18",
+  "appBuild": "3814",
+  "backup": "/Users/bookme/Library/Containers/V380-Ori.Astris/Data/Documents/SMOShaders/app-backup-c9rmajea/Astris.app",
+  "installed": {
+    "Contents/Frameworks/libSMOShaderLoader.dylib": "aed4f2033dc54ec0d7872009b58723d32921fe4a337c8aca52b9f3463b9a737b",
+    "Contents/_CodeSignature/CodeResources": "13d0ecaefd0523fda3183f5b2061043ab71fa9ed231a3200ff26673b0526c565",
+    "Contents/MacOS/Astris": "ff94a72a246a552370431fb8022658458ed6a075ef44317c3d0c2523be4e0ea8"
+  },
+  "loadPath": "@executable_path/../Frameworks/libSMOShaderLoader.dylib",
+  "originalExecutableSHA256": "1dd425c4e3026e52583de90540818c7fb80a518736a39647daa275f8fb8452dd"
+}
