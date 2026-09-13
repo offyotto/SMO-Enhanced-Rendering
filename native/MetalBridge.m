@@ -14,7 +14,7 @@ static NSUInteger depthArea;
 static os_unfair_lock stateLock = OS_UNFAIR_LOCK_INIT;
 static FILE *logFile;
 static IMP originalNext, originalRender, originalCommit;
-static NSMutableSet<NSString *> *seenDepths, *seenLabels;
+static NSMutableSet<NSString *> *seenDepths, *seenColors, *seenLabels;
 static _Thread_local BOOL insideProcessor;
 
 static void Log(NSString *message) {
@@ -44,9 +44,36 @@ static id<CAMetalDrawable> NextDrawable(CAMetalLayer *layer, SEL sel) {
 
 static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLRenderPassDescriptor *desc) {
     if (!insideProcessor) {
+        os_unfair_lock_lock(&stateLock);
+
+        // Record unique color-attachment signatures from the guest renderer.
+        // A native motion-vector/velocity target, if Odyssey emits one, must
+        // eventually appear here because MoltenVK maps guest render targets to
+        // Metal render-pass color attachments. We deliberately do not retain,
+        // modify, or force-store anything yet; this first stage is observation.
+        for (NSUInteger i=0; i<8; ++i) {
+            MTLRenderPassColorAttachmentDescriptor *att=desc.colorAttachments[i];
+            id<MTLTexture> tex=att.texture;
+            if (!tex || tex.width < 160 || tex.height < 90) continue;
+            id<MTLTexture> resolve=att.resolveTexture;
+            NSString *key=[NSString stringWithFormat:
+                @"slot=%lu %lux%lu fmt=%lu type=%lu samples=%lu usage=%lu storage=%lu load=%lu store=%lu resolve=%lux%lu rfmt=%lu label=%@",
+                (unsigned long)i,
+                (unsigned long)tex.width,(unsigned long)tex.height,
+                (unsigned long)tex.pixelFormat,(unsigned long)tex.textureType,
+                (unsigned long)tex.sampleCount,(unsigned long)tex.usage,
+                (unsigned long)tex.storageMode,(unsigned long)att.loadAction,
+                (unsigned long)att.storeAction,
+                (unsigned long)resolve.width,(unsigned long)resolve.height,
+                (unsigned long)resolve.pixelFormat,tex.label ?: @"<none>"];
+            if (seenColors.count < 240 && ![seenColors containsObject:key]) {
+                [seenColors addObject:key];
+                Log([@"color " stringByAppendingString:key]);
+            }
+        }
+
         id<MTLTexture> tex = desc.depthAttachment.texture;
         if (tex && tex.width >= 320 && tex.height >= 180) {
-            os_unfair_lock_lock(&stateLock);
             draws++;
             NSString *key = [NSString stringWithFormat:@"%p %lux%lu fmt=%lu type=%lu samples=%lu usage=%lu storage=%lu load=%lu store=%lu clear=%.9g label=%@", (__bridge void *)tex, tex.width, tex.height, tex.pixelFormat, tex.textureType, tex.sampleCount, tex.usage, tex.storageMode, desc.depthAttachment.loadAction, desc.depthAttachment.storeAction, desc.depthAttachment.clearDepth, tex.label];
             if (seenDepths.count < 120 && ![seenDepths containsObject:key]) { [seenDepths addObject:key]; Log([@"depth " stringByAppendingString:key]); }
@@ -56,8 +83,8 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
                 depthSerial = frameSerial;
                 depthArea = tex.width*tex.height;
             }
-            os_unfair_lock_unlock(&stateLock);
         }
+        os_unfair_lock_unlock(&stateLock);
     }
     return ((id (*)(id, SEL, id))originalRender)(cb, sel, desc);
 }
@@ -98,7 +125,7 @@ __attribute__((visibility("default"))) void SMOSetFrameProcessor(FrameProcessor 
 __attribute__((visibility("default"))) const char *SMOBridgeStatus(void) {
     static char status[512];
     os_unfair_lock_lock(&stateLock);
-    snprintf(status, sizeof(status), "commits=%llu presents=%llu depthPasses=%llu drawable=%lux%lu depth=%lux%lu effect=%s", commits, presents, draws, currentDrawable.texture.width, currentDrawable.texture.height, currentDepth.width, currentDepth.height, processor ? "on" : "off");
+    snprintf(status, sizeof(status), "commits=%llu presents=%llu depthPasses=%llu drawable=%lux%lu depth=%lux%lu effect=%s colorSignatures=%lu", commits, presents, draws, currentDrawable.texture.width, currentDrawable.texture.height, currentDepth.width, currentDepth.height, processor ? "on" : "off", (unsigned long)seenColors.count);
     os_unfair_lock_unlock(&stateLock);
     return status;
 }
@@ -108,7 +135,7 @@ __attribute__((constructor)) static void Install(void) {
         NSString *directory = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/SMOShaders"];
         [[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
         logFile = fopen([[directory stringByAppendingPathComponent:@"bridge.log"] fileSystemRepresentation], "a");
-        seenDepths = [NSMutableSet new]; seenLabels = [NSMutableSet new];
+        seenDepths = [NSMutableSet new]; seenColors = [NSMutableSet new]; seenLabels = [NSMutableSet new];
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         id<MTLCommandQueue> queue = [device newCommandQueue];
         id<MTLCommandBuffer> cb = [queue commandBuffer];
