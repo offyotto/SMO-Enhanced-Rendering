@@ -82,16 +82,13 @@ MaterialInfo classifyMaterial(float3 base,GeometryInfo geometry) {
 
     float warm=smoothstep(.02,.14,base.r-base.b)*(1-smoothstep(base.r*1.03,base.r*1.40,base.g));
     float water=smoothstep(.025,.12,base.b-base.r)*smoothstep(base.g*.52,base.g*.78,base.b)*.82;
-    float grass=smoothstep(.03,.12,base.g-max(base.r,base.b))*.22;
-    // Neutral colors are ambiguous: stone, cloth, skin highlights and metal can
-    // all look neutral after the game's lighting. Keep this conservative so a
-    // character is not turned into a mirror just because it is grey/white.
-    float neutral=(1-smoothstep(.05,.14,chroma))*.11;
+    float grass=smoothstep(.03,.12,base.g-max(base.r,base.b))*.30;
+    float neutral=(1-smoothstep(.06,.16,chroma))*.18;
 
     float weight=clamp(max(max(warm,water),grass)+neutral,0.0,1.0);
     float sum=warm+water+grass+neutral+.0001;
-    float roughness=(warm*.50+water*.08+grass*.84+neutral*.72)/sum;
-    roughness=clamp(roughness+geometry.curvature*.22+(1-geometry.continuity)*.14,.06,.92);
+    float roughness=(warm*.46+water*.08+grass*.78+neutral*.58)/sum;
+    roughness=clamp(roughness+geometry.curvature*.18+(1-geometry.continuity)*.10,.06,.88);
 
     MaterialInfo info;
     info.weight=weight;
@@ -104,17 +101,6 @@ float sceneMask(float2 uv) {
     float bottom=smoothstep(.90,.98,uv.y);
     return 1-max(max(topLeft,topRight),bottom);
 }
-float reflectionReceiver(GeometryInfo geometry,float3 n) {
-    // Odyssey's useful SSR receivers are overwhelmingly floors, puddles and
-    // water. Character surfaces are curved, depth-discontinuous and usually
-    // face the camera rather than upward. Gate on all three signals. This only
-    // controls which pixels RECEIVE SSR; Mario/Bowser can still APPEAR inside a
-    // floor reflection because they remain present in the source color buffer.
-    float upFacing=smoothstep(.12,.50,n.y);
-    float planar=1-smoothstep(.07,.38,geometry.curvature);
-    float stable=smoothstep(.30,.82,geometry.continuity);
-    return clamp(upFacing*planar*stable,0.0,1.0);
-}
 float depthSimilarity(depth2d<float> depth,float2 uv,float centerZ,float tolerance) {
     float raw=depth.sample(depthSampler,clamp(uv,.001,.999));
     if (raw>.99998||raw<.001) return 0;
@@ -124,8 +110,6 @@ float depthSimilarity(depth2d<float> depth,float2 uv,float centerZ,float toleran
 float3 filteredReflection(texture2d<float> color,depth2d<float> depth,
                           float2 hitUV,float hitZ,float roughness,float travelRatio,
                           constant Settings &s) {
-    // Cross-bilateral cone blur. Rougher and farther hits widen, while depth
-    // rejection prevents foreground silhouettes from bleeding into reflections.
     float radius=mix(1.0,7.0,roughness*roughness)*(1+min(travelRatio,3.0)*.18);
     float2 ox=float2(s.texel.x*radius,0),oy=float2(0,s.texel.y*radius);
     float tolerance=max(.08,hitZ*(.012+.010*roughness));
@@ -149,10 +133,21 @@ float3 filteredReflection(texture2d<float> color,depth2d<float> depth,
 float3 fireflyClamp(float3 reflection,float3 base) {
     reflection=max(reflection,0.0);
     float reflectedLuma=luminance(reflection);
-    // Preserve HDR highlights while preventing a single emissive texel from
-    // exploding into a broad white glossy patch.
-    float limit=max(5.0,luminance(base)*10.0+1.5);
+    float limit=max(6.0,luminance(base)*12.0+2.0);
     return reflection*min(1.0,limit/max(reflectedLuma,.0001));
+}
+float sourceDistanceConfidence(GeometryInfo hitGeometry,float travelRatio,float pixelTravel,float roughness) {
+    // Do not suppress the receiver surface. The ugly character cases happen when
+    // a long SSR ray resolves to small/curved/discontinuous source geometry.
+    // Nearby character reflections remain possible; only increasingly long,
+    // unstable source hits are attenuated.
+    float stable=smoothstep(.10,.70,hitGeometry.continuity);
+    float planar=1-smoothstep(.28,.88,hitGeometry.curvature);
+    float sourceGeometry=mix(.42,1.0,stable*mix(.68,1.0,planar));
+    float longRay=smoothstep(.55,1.75,travelRatio);
+    float maxPixels=mix(720.0,360.0,roughness);
+    float screenTrust=1-smoothstep(maxPixels*.72,maxPixels,pixelTravel);
+    return mix(1.0,sourceGeometry,longRay)*screenTrust;
 }
 
 fragment float4 surfaceEffects(VertexOut in [[stage_in]],
@@ -166,7 +161,6 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     float3 p=positionAt(depth,uv,s);
     GeometryInfo geometry=geometryAt(depth,uv,p,s);
     float3 n=geometry.normal;
-    float receiver=reflectionReceiver(geometry,n);
     float jitter=fract(52.9829189*fract(dot(floor(in.position.xy),float2(.06711056,.00583715))));
 
     float ao=0;
@@ -191,14 +185,14 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     float3 view=normalize(p);
     float3 ray=reflect(view,n);
     float fresnel=.20+.80*pow(1-clamp(dot(n,-view),0.0,1.0),4.0);
-    float roughEnergy=mix(1.0,.68,materialInfo.roughness);
-    float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy*receiver;
+    float roughEnergy=mix(1.0,.72,materialInfo.roughness);
+    float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy;
 
     float3 reflection=0;
     float confidence=0;
     if (reflectivity>.010&&geometry.continuity>.04) {
         float3 origin=p+n*(p.z*(.0012+.0010*(1-geometry.continuity)));
-        float maxDistance=p.z*mix(3.7,2.25,materialInfo.roughness);
+        float maxDistance=p.z*mix(4.1,2.55,materialInfo.roughness);
         float previousDistance=max(p.z*.008,.015);
         float3 previousP=origin+ray*previousDistance;
         float2 previousUV=project(previousP,s);
@@ -215,7 +209,7 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
             float2 sampleUV=project(sampleP,s);
             if (!validUV(sampleUV)) break;
 
-            float targetPixels=mix(1.35,2.85,materialInfo.roughness);
+            float targetPixels=mix(1.30,2.65,materialInfo.roughness);
             float pixelAdvance=length((sampleUV-previousUV)/max(s.depthTexel,float2(1e-6)));
             if (pixelAdvance<targetPixels&&distance<maxDistance) {
                 float scale=min(targetPixels/max(pixelAdvance,.05),3.5);
@@ -233,7 +227,9 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
                 for (uint refine=0;refine<5;++refine) {
                     float mid=(lo+hi)*.5;
                     float3 testP=origin+ray*mid;
-                    float testDelta=testP.z-zValue(depth,project(testP,s));
+                    float2 testUV=project(testP,s);
+                    if (!validUV(testUV)) { hi=mid; continue; }
+                    float testDelta=testP.z-zValue(depth,testUV);
                     if (testDelta>0) hi=mid; else lo=mid;
                 }
 
@@ -254,12 +250,14 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
                         float edge=smoothstep(0.0,.085,min(min(hitUV.x,hitUV.y),min(1-hitUV.x,1-hitUV.y)));
                         float pixelSeparation=length((hitUV-uv)/max(s.depthTexel,float2(1e-6)));
                         float separation=smoothstep(2.5,11.0,pixelSeparation);
-                        float distanceFade=1-smoothstep(maxDistance*.68,maxDistance,hitDistance);
-                        float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*geometry.continuity*hitGeometry.continuity;
+                        float travelRatio=hitDistance/max(p.z,.1);
+                        float distanceFade=1-smoothstep(.78,.99,hitDistance/max(maxDistance,.001));
+                        float sourceTrust=sourceDistanceConfidence(hitGeometry,travelRatio,pixelSeparation,materialInfo.roughness);
+                        float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*geometry.continuity*hitGeometry.continuity*sourceTrust;
 
-                        if (candidate>.025) {
+                        if (candidate>.020) {
                             confidence=candidate;
-                            reflection=filteredReflection(color,depth,hitUV,hitZ,materialInfo.roughness,hitDistance/max(p.z,.1),s);
+                            reflection=filteredReflection(color,depth,hitUV,hitZ,materialInfo.roughness,travelRatio,s);
                             reflection=fireflyClamp(reflection,base);
                             break;
                         }
@@ -276,10 +274,10 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
 
     float mask=sceneMask(uv);
     float darkening=smoothstep(0.0,.25,luminance(base)-luminance(reflection));
-    float strength=min(reflectivity*confidence,.66)*(1-.78*darkening);
+    float strength=min(reflectivity*confidence,.72)*(1-.72*darkening);
     float3 addition=(reflection-base)*strength+bounce;
 
-    if (s.debugView>2.5) return float4(float3(confidence*materialInfo.weight*receiver),1);
+    if (s.debugView>2.5) return float4(float3(confidence*materialInfo.weight),1);
     if (s.debugView>1.5) return float4(n*.5+.5,1);
     if (s.debugView>.5) return float4(float3(log2(p.z)/12),1);
     return float4(addition*mask,mix(1.0,ao,mask));
@@ -290,8 +288,6 @@ fragment float4 bloomExtract(VertexOut in [[stage_in]],texture2d<float> color [[
     float3 c=(color.sample(linearSampler,in.uv+t).rgb+color.sample(linearSampler,in.uv-t).rgb+
         color.sample(linearSampler,in.uv+float2(t.x,-t.y)).rgb+color.sample(linearSampler,in.uv+float2(-t.x,t.y)).rgb)*.25;
     c=max(c,0.0);
-    // Use luminance instead of max-channel brightness so saturated sky/water
-    // does not bloom merely because one HDR channel is large.
     float brightness=luminance(c);
     float threshold=.82;
     float knee=.28;
@@ -316,9 +312,6 @@ fragment float4 composite(VertexOut in [[stage_in]],texture2d<float> original [[
 
     float3 c=max(raw*fx.a+fx.rgb,0.0);
     float rawL=luminance(raw);
-    // The emulator has already applied the game's HDR/tone curve. Avoid piling
-    // extra bloom and grading onto very bright daylight pixels, which was
-    // washing Cascade Kingdom into white/cyan.
     float highlightProtect=1-smoothstep(.65,1.55,rawL);
     float bloomProtect=1-.75*smoothstep(.85,2.25,rawL);
     c+=bloomTex.sample(linearSampler,in.uv).rgb*s.bloom*bloomProtect;
