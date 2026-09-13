@@ -82,13 +82,16 @@ MaterialInfo classifyMaterial(float3 base,GeometryInfo geometry) {
 
     float warm=smoothstep(.02,.14,base.r-base.b)*(1-smoothstep(base.r*1.03,base.r*1.40,base.g));
     float water=smoothstep(.025,.12,base.b-base.r)*smoothstep(base.g*.52,base.g*.78,base.b)*.82;
-    float grass=smoothstep(.03,.12,base.g-max(base.r,base.b))*.28;
-    float neutral=(1-smoothstep(.06,.16,chroma))*.18;
+    float grass=smoothstep(.03,.12,base.g-max(base.r,base.b))*.22;
+    // Neutral colors are ambiguous: stone, cloth, skin highlights and metal can
+    // all look neutral after the game's lighting. Keep this conservative so a
+    // character is not turned into a mirror just because it is grey/white.
+    float neutral=(1-smoothstep(.05,.14,chroma))*.11;
 
     float weight=clamp(max(max(warm,water),grass)+neutral,0.0,1.0);
     float sum=warm+water+grass+neutral+.0001;
-    float roughness=(warm*.46+water*.08+grass*.78+neutral*.58)/sum;
-    roughness=clamp(roughness+geometry.curvature*.18+(1-geometry.continuity)*.10,.06,.88);
+    float roughness=(warm*.50+water*.08+grass*.84+neutral*.72)/sum;
+    roughness=clamp(roughness+geometry.curvature*.22+(1-geometry.continuity)*.14,.06,.92);
 
     MaterialInfo info;
     info.weight=weight;
@@ -100,6 +103,17 @@ float sceneMask(float2 uv) {
     float topRight=smoothstep(.85,.90,uv.x)*(1-smoothstep(.36,.44,uv.y));
     float bottom=smoothstep(.90,.98,uv.y);
     return 1-max(max(topLeft,topRight),bottom);
+}
+float reflectionReceiver(GeometryInfo geometry,float3 n) {
+    // Odyssey's useful SSR receivers are overwhelmingly floors, puddles and
+    // water. Character surfaces are curved, depth-discontinuous and usually
+    // face the camera rather than upward. Gate on all three signals. This only
+    // controls which pixels RECEIVE SSR; Mario/Bowser can still APPEAR inside a
+    // floor reflection because they remain present in the source color buffer.
+    float upFacing=smoothstep(.12,.50,n.y);
+    float planar=1-smoothstep(.07,.38,geometry.curvature);
+    float stable=smoothstep(.30,.82,geometry.continuity);
+    return clamp(upFacing*planar*stable,0.0,1.0);
 }
 float depthSimilarity(depth2d<float> depth,float2 uv,float centerZ,float tolerance) {
     float raw=depth.sample(depthSampler,clamp(uv,.001,.999));
@@ -137,7 +151,7 @@ float3 fireflyClamp(float3 reflection,float3 base) {
     float reflectedLuma=luminance(reflection);
     // Preserve HDR highlights while preventing a single emissive texel from
     // exploding into a broad white glossy patch.
-    float limit=max(6.0,luminance(base)*12.0+2.0);
+    float limit=max(5.0,luminance(base)*10.0+1.5);
     return reflection*min(1.0,limit/max(reflectedLuma,.0001));
 }
 
@@ -152,6 +166,7 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     float3 p=positionAt(depth,uv,s);
     GeometryInfo geometry=geometryAt(depth,uv,p,s);
     float3 n=geometry.normal;
+    float receiver=reflectionReceiver(geometry,n);
     float jitter=fract(52.9829189*fract(dot(floor(in.position.xy),float2(.06711056,.00583715))));
 
     float ao=0;
@@ -176,14 +191,14 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     float3 view=normalize(p);
     float3 ray=reflect(view,n);
     float fresnel=.20+.80*pow(1-clamp(dot(n,-view),0.0,1.0),4.0);
-    float roughEnergy=mix(1.0,.72,materialInfo.roughness);
-    float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy;
+    float roughEnergy=mix(1.0,.68,materialInfo.roughness);
+    float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy*receiver;
 
     float3 reflection=0;
     float confidence=0;
-    if (reflectivity>.012&&geometry.continuity>.04) {
+    if (reflectivity>.010&&geometry.continuity>.04) {
         float3 origin=p+n*(p.z*(.0012+.0010*(1-geometry.continuity)));
-        float maxDistance=p.z*mix(3.7,2.35,materialInfo.roughness);
+        float maxDistance=p.z*mix(3.7,2.25,materialInfo.roughness);
         float previousDistance=max(p.z*.008,.015);
         float3 previousP=origin+ray*previousDistance;
         float2 previousUV=project(previousP,s);
@@ -191,8 +206,6 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
         if (previousP.z>.1&&validUV(previousUV)) previousDelta=previousP.z-zValue(depth,previousUV);
 
         for (uint step=0;step<48;++step) {
-            // Exponential reach plus adaptive screen-space stride avoids burning
-            // samples inside the same pixels near the ray origin.
             float scheduled=p.z*.020*exp2((float(step)+jitter)*.145);
             float distance=max(scheduled,previousDistance+max(p.z*.001,.01));
             if (distance>maxDistance) distance=maxDistance;
@@ -244,8 +257,6 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
                         float distanceFade=1-smoothstep(maxDistance*.68,maxDistance,hitDistance);
                         float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*geometry.continuity*hitGeometry.continuity;
 
-                        // Silhouette crossings no longer kill the ray. Reject the
-                        // candidate and continue until a plausible surface is hit.
                         if (candidate>.025) {
                             confidence=candidate;
                             reflection=filteredReflection(color,depth,hitUV,hitZ,materialInfo.roughness,hitDistance/max(p.z,.1),s);
@@ -265,10 +276,10 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
 
     float mask=sceneMask(uv);
     float darkening=smoothstep(0.0,.25,luminance(base)-luminance(reflection));
-    float strength=min(reflectivity*confidence,.72)*(1-.74*darkening);
+    float strength=min(reflectivity*confidence,.66)*(1-.78*darkening);
     float3 addition=(reflection-base)*strength+bounce;
 
-    if (s.debugView>2.5) return float4(float3(confidence*materialInfo.weight),1);
+    if (s.debugView>2.5) return float4(float3(confidence*materialInfo.weight*receiver),1);
     if (s.debugView>1.5) return float4(n*.5+.5,1);
     if (s.debugView>.5) return float4(float3(log2(p.z)/12),1);
     return float4(addition*mask,mix(1.0,ao,mask));
@@ -279,9 +290,15 @@ fragment float4 bloomExtract(VertexOut in [[stage_in]],texture2d<float> color [[
     float3 c=(color.sample(linearSampler,in.uv+t).rgb+color.sample(linearSampler,in.uv-t).rgb+
         color.sample(linearSampler,in.uv+float2(t.x,-t.y)).rgb+color.sample(linearSampler,in.uv+float2(-t.x,t.y)).rgb)*.25;
     c=max(c,0.0);
-    float brightness=max(c.r,max(c.g,c.b));
-    float knee=clamp(brightness-.35,0.0,.40);
-    float contribution=max(brightness-.55,knee*knee/.80)/max(brightness,.0001);
+    // Use luminance instead of max-channel brightness so saturated sky/water
+    // does not bloom merely because one HDR channel is large.
+    float brightness=luminance(c);
+    float threshold=.82;
+    float knee=.28;
+    float soft=clamp((brightness-threshold+knee)/(2*knee),0.0,1.0);
+    soft=soft*soft*knee;
+    float contribution=(max(brightness-threshold,0.0)+soft)/max(brightness,.0001);
+    contribution=min(contribution,.58);
     return float4(c*contribution*sceneMask(in.uv),1);
 }
 fragment float4 bloomBlur(VertexOut in [[stage_in]],texture2d<float> color [[texture(0)]],constant Settings &s [[buffer(0)]]) {
@@ -293,18 +310,29 @@ fragment float4 bloomBlur(VertexOut in [[stage_in]],texture2d<float> color [[tex
 }
 fragment float4 composite(VertexOut in [[stage_in]],texture2d<float> original [[texture(0)]],
     texture2d<float> effects [[texture(1)]],texture2d<float> bloomTex [[texture(2)]],constant Settings &s [[buffer(0)]]) {
-    float3 raw=original.sample(linearSampler,in.uv).rgb;
+    float3 raw=max(original.sample(linearSampler,in.uv).rgb,0.0);
     float4 fx=effects.sample(linearSampler,in.uv);
     if (s.debugView>.5) return float4(fx.rgb,1);
+
     float3 c=max(raw*fx.a+fx.rgb,0.0);
-    c+=bloomTex.sample(linearSampler,in.uv).rgb*s.bloom;
+    float rawL=luminance(raw);
+    // The emulator has already applied the game's HDR/tone curve. Avoid piling
+    // extra bloom and grading onto very bright daylight pixels, which was
+    // washing Cascade Kingdom into white/cyan.
+    float highlightProtect=1-smoothstep(.65,1.55,rawL);
+    float bloomProtect=1-.75*smoothstep(.85,2.25,rawL);
+    c+=bloomTex.sample(linearSampler,in.uv).rgb*s.bloom*bloomProtect;
+
     float mask=sceneMask(in.uv);
-    c*=s.exposure;
+    float exposure=mix(1.0,s.exposure,highlightProtect);
+    c*=exposure;
     float l=luminance(c);
-    c=mix(float3(l),c,s.saturation);
-    c=(c-.18)*s.contrast+.18;
+    float saturation=mix(1.0,s.saturation,highlightProtect);
+    float contrast=mix(1.0,s.contrast,highlightProtect);
+    c=mix(float3(l),c,saturation);
+    c=(c-.18)*contrast+.18;
     float shadow=1-smoothstep(.015,.18,l);
-    float highlight=smoothstep(.28,.95,l);
+    float highlight=smoothstep(.28,.95,l)*highlightProtect;
     c+=float3(-.0015,.001,.0035)*shadow+float3(.008,.002,-.003)*highlight;
     return float4(mix(raw,max(c,0.0),mask),1);
 }
