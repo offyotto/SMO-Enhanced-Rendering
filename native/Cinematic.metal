@@ -154,6 +154,23 @@ float sourceDistanceConfidence(GeometryInfo hitGeometry,float travelRatio,float 
     float screenTrust=1-smoothstep(maxPixels*.72,maxPixels,pixelTravel);
     return mix(1.0,sourceGeometry,longRay)*screenTrust;
 }
+float hdrSurfaceTrust(float3 base) {
+    // The source color is an RGBA16F post-render image, so effects such as
+    // waterfalls, mist and additive particles can contain very large HDR values
+    // while the depth buffer still belongs to opaque geometry behind them.
+    // Depth-driven AO/SSGI/SSR must not treat those bright overlays as opaque
+    // surfaces. Normal scene colors are untouched; only the HDR tail fades out.
+    return 1-smoothstep(.72,1.45,luminance(base));
+}
+float3 clampIndirectSample(float3 c) {
+    // SSGI/bounce used to accumulate raw HDR source values without a limiter.
+    // A waterfall texel at several times display white could therefore inject
+    // enormous energy even with bloom disabled. Preserve useful indirect color
+    // while bounding emissive/transparent outliers.
+    c=max(c,0.0);
+    float l=luminance(c);
+    return c*min(1.0,2.25/max(l,.0001));
+}
 
 fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],
@@ -167,6 +184,8 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     GeometryInfo geometry=geometryAt(depth,uv,p,s);
     float3 n=geometry.normal;
     float farTrust=farDepthTrust(rawDepth);
+    float hdrTrust=hdrSurfaceTrust(base);
+    float surfaceTrust=farTrust*hdrTrust;
     float traceZ=min(p.z,512.0);
     float jitter=fract(52.9829189*fract(dot(floor(in.position.xy),float2(.06711056,.00583715))));
 
@@ -183,18 +202,21 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
         float distance=length(v);
         float weight=max(dot(n,v/max(distance,.0001))-.075,0.0)*(1-smoothstep(radius*.25,radius,distance));
         ao+=weight;
-        bounce+=max(color.sample(linearSampler,sampleUV).rgb,0.0)*weight;
+        bounce+=clampIndirectSample(color.sample(linearSampler,sampleUV).rgb)*weight;
     }
     ao=clamp(1-ao*(s.occlusion/4.0),.58,1.0);
-    ao=mix(1.0,ao,farTrust);
-    bounce*=.035*farTrust;
+    ao=mix(1.0,ao,surfaceTrust);
+    // Bounce is part of the depth-driven indirect-light pass. It now follows
+    // the occlusion control, respects HDR/transparent receiver rejection, and
+    // cannot remain secretly enabled when occlusion is set to zero.
+    bounce*=.035*min(s.occlusion,1.0)*surfaceTrust*geometry.continuity;
 
     MaterialInfo materialInfo=classifyMaterial(base,geometry);
     float3 view=normalize(p);
     float3 ray=reflect(view,n);
     float fresnel=.20+.80*pow(1-clamp(dot(n,-view),0.0,1.0),4.0);
     float roughEnergy=mix(1.0,.72,materialInfo.roughness);
-    float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy*farTrust;
+    float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy*surfaceTrust;
 
     float3 reflection=0;
     float confidence=0;
@@ -263,7 +285,8 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
                         float distanceFade=1-smoothstep(.78,.99,hitDistance/max(maxDistance,.001));
                         float sourceTrust=sourceDistanceConfidence(hitGeometry,travelRatio,pixelSeparation,materialInfo.roughness);
                         float hitFarTrust=farDepthTrust(hitRaw);
-                        float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*geometry.continuity*hitGeometry.continuity*sourceTrust*hitFarTrust;
+                        float hitHdrTrust=hdrSurfaceTrust(max(color.sample(linearSampler,hitUV).rgb,0.0));
+                        float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*geometry.continuity*hitGeometry.continuity*sourceTrust*hitFarTrust*hitHdrTrust;
 
                         if (candidate>.020) {
                             confidence=candidate;
@@ -287,7 +310,7 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     float strength=min(reflectivity*confidence,.72)*(1-.72*darkening);
     float3 addition=(reflection-base)*strength+bounce;
 
-    if (s.debugView>2.5) return float4(float3(confidence*materialInfo.weight*farTrust),1);
+    if (s.debugView>2.5) return float4(float3(confidence*materialInfo.weight*surfaceTrust),1);
     if (s.debugView>1.5) return float4(n*.5+.5,1);
     if (s.debugView>.5) return float4(float3(log2(p.z)/12),1);
     return float4(addition*mask,mix(1.0,ao,mask));
