@@ -12,8 +12,10 @@ The shaders use the color and depth textures from the current frame. They do not
 Reflections can include only objects that appear in the frame. Reflections fade at screen edges.
 Transparent surfaces and thin objects can show reflection errors. The shaders preserve fixed HUD regions.
 
+The current SSR path builds a conservative R32Float closest-depth hierarchy with up to seven mip levels every fresh-depth frame, then traverses that hierarchy instead of using the older fixed/exponential full-resolution depth march. The hierarchy is private GPU storage and is reused per in-flight frame slot.
+
 The installed preset uses the current HDR output. Keep HDR enabled in Astris.
-The reflections use a 1280-pixel texture. The final image retains the original output resolution.
+The reflection/contact pass uses a 1280-pixel effect texture by default. The final image retains the original output resolution.
 
 The shader loader starts with Astris. It applies the shaders when an Odyssey window is present.
 The loader supports Astris build 3814. An Astris update can remove the loader.
@@ -26,8 +28,22 @@ The active preset is here:
 
 `~/Library/Containers/V380-Ori.Astris/Data/Documents/SMOShaders/preset.json`
 
-The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, and `effectWidth`.
-Set `debugView` to `0` for normal use. Values `1`, `2`, and `3` show depth, normals, and reflection hits.
+The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, `effectWidth`, `debugView`, and `debugMip`.
+
+Hi-Z debug modes:
+
+- `debugView: 0` — normal composite.
+- `debugView: 1` — reconstructed view-space depth.
+- `debugView: 2` — reconstructed normals.
+- `debugView: 3` — SSR hit confidence.
+- `debugView: 4` — raw guest depth.
+- `debugView: 5` — depth-hierarchy visualization. Select mip `0` through `6` with `debugMip`.
+- `debugView: 6` — traversal cost: red = total hierarchy reads / 64, green = mip-0 reads / 64, blue = candidate hits / 8.
+- `debugView: 7` — reflected radiance before final compositing.
+- `debugView: 8` — trace termination/rejection reason.
+- `debugView: 9` — material diagnostics: red = reflection weight, green = roughness, blue = surface trust.
+
+`debugView: 8` colors are: green = accepted hit, red = rejected candidate, blue = screen edge, purple = depth/far-depth rejection, yellow = low material weight, magenta = traversal budget, brown = unstable geometry, cyan = HDR/transparent-color rejection, gray = fresh depth or hierarchy unavailable.
 
 Run this command from this folder to restore the original Astris application:
 
@@ -38,8 +54,7 @@ python3 install_shaders.py --restore
 The installer records the original application backup in `installation.json` beside the active preset.
 The restore command checks the installed file hashes before it changes Astris.
 
-The shader pipelines passed Metal API Validation with a captured Odyssey frame.
-The live preset maintained 60 FPS during the observed gameplay. Performance depends on the scene and output resolution.
+The Hi-Z implementation has passed the repository's compile-only Metal pipeline check on Apple Silicon. Visual quality, traversal cost, and live 60 FPS behavior still require in-game validation because the compile-only path cannot reproduce every Astris/MoltenVK render-pass interaction.
 
 The direct Metal integration follows the presentation sequence in [MoltenVK](https://github.com/KhronosGroup/MoltenVK/blob/main/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm).
 The shaders and native integration in this package are custom source code.
