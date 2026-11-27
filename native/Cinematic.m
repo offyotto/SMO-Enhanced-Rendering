@@ -56,6 +56,7 @@ static ShaderFrame *heldFrame;
 static BOOL captureRequested;
 // Returns the G-buffer normal target of the frame being presented, or nil.
 static id<MTLTexture> (*frameNormals)(void);
+static id<MTLTexture> (*frameGBuffer)(NSUInteger);
 static double presentCBMilliseconds;
 static NSString *lastError = @"none";
 static FILE *logFile;
@@ -313,8 +314,32 @@ static void EncodeCapture(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLT
     [blit copyFromTexture:depth sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:size toBuffer:b destinationOffset:0 destinationBytesPerRow:ds destinationBytesPerImage:ds*depth.height];
     if (c) [blit copyFromTexture:previous sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:size toBuffer:c destinationOffset:0 destinationBytesPerRow:ds destinationBytesPerImage:ds*depth.height];
     if (n) [blit copyFromTexture:normals sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:MTLSizeMake(normals.width,normals.height,1) toBuffer:n destinationOffset:0 destinationBytesPerRow:ns destinationBytesPerImage:ns*normals.height];
+    // Every readable color target of the G-buffer pass, to identify them.
+    NSMutableDictionary *targets=[NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *,id<MTLBuffer>> *targetData=[NSMutableDictionary dictionary];
+    for (NSUInteger slot=0; slot<4 && frameGBuffer; ++slot) {
+        id<MTLTexture> t=frameGBuffer(slot);
+        if (!t) continue;
+        NSUInteger bytes=0;
+        switch (t.pixelFormat) {
+            case MTLPixelFormatR16Float: bytes=2; break;
+            case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm:
+            case MTLPixelFormatRG16Snorm: case MTLPixelFormatRG16Float: case MTLPixelFormatR32Float:
+            case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRG11B10Float: bytes=4; break;
+            case MTLPixelFormatRGBA16Float: bytes=8; break;
+            default: break;
+        }
+        NSString *key=[NSString stringWithFormat:@"gbuffer-%lu",(unsigned long)slot];
+        targets[key]=@{@"format":@(t.pixelFormat),@"width":@(t.width),@"height":@(t.height),@"bytesPerPixel":@(bytes)};
+        if (!bytes || t.textureType!=MTLTextureType2D || t.sampleCount!=1 || t.storageMode==MTLStorageModeMemoryless ||
+            t.device.registryID!=color.device.registryID) continue;
+        id<MTLBuffer> data=[color.device newBufferWithLength:t.width*bytes*t.height options:MTLResourceStorageModeShared];
+        if (!data) continue;
+        [blit copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:MTLSizeMake(t.width,t.height,1) toBuffer:data destinationOffset:0 destinationBytesPerRow:t.width*bytes destinationBytesPerImage:data.length];
+        targetData[key]=data;
+    }
     [blit endEncoding];
-    NSDictionary *info=@{@"normalsWidth":@(n ? normals.width : 0),@"normalsHeight":@(n ? normals.height : 0),@"normalsStride":@(n ? ns : 0),@"colorWidth":@(color.width),@"colorHeight":@(color.height),@"colorStride":@(cs),
+    NSDictionary *info=@{@"targets":targets,@"normalsWidth":@(n ? normals.width : 0),@"normalsHeight":@(n ? normals.height : 0),@"normalsStride":@(n ? ns : 0),@"colorWidth":@(color.width),@"colorHeight":@(color.height),@"colorStride":@(cs),
         @"depthWidth":@(depth.width),@"depthHeight":@(depth.height),@"depthStride":@(ds),@"previousDepth":@(c!=nil)};
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         if (done.status!=MTLCommandBufferStatusCompleted) { Log(@"Alignment capture failed; nothing written."); return; }
@@ -323,6 +348,7 @@ static void EncodeCapture(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLT
         [[NSData dataWithBytesNoCopy:a.contents length:a.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"color.rgba16f"] atomically:YES];
         [[NSData dataWithBytesNoCopy:b.contents length:b.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"depth.r32f"] atomically:YES];
         if (n) [[NSData dataWithBytesNoCopy:n.contents length:n.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"normals.rg16s"] atomically:YES];
+        for (NSString *key in targetData) [[NSData dataWithBytesNoCopy:targetData[key].contents length:targetData[key].length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:[key stringByAppendingString:@".bin"]] atomically:YES];
         if (c) [[NSData dataWithBytesNoCopy:c.contents length:c.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"depth-previous.r32f"] atomically:YES];
         [[NSJSONSerialization dataWithJSONObject:info options:NSJSONWritingPrettyPrinted error:nil] writeToFile:[folder stringByAppendingPathComponent:@"capture.json"] atomically:YES];
         Log(@"Alignment capture written to align-capture.");
@@ -609,6 +635,7 @@ __attribute__((constructor)) static void Install(void) {
         if (!LoadProgram()) return;
         SettingsChanged();
         frameNormals=dlsym(RTLD_DEFAULT,"SMOFrameNormals");
+        frameGBuffer=dlsym(RTLD_DEFAULT,"SMOFrameGBuffer");
         if (!frameNormals) Log(@"This Metal bridge does not provide the game's normals.");
         setProcessor(ProcessFrame);
         timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));

@@ -9,6 +9,8 @@ typedef void (*FrameProcessor)(id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTextu
 static FrameProcessor processor;
 static id<CAMetalDrawable> currentDrawable;
 static id<MTLTexture> currentDepth, currentNormals, frameNormals;
+// Every color target of the pass that wrote the normals.
+static id<MTLTexture> currentGBuffer[4], frameGBuffer[4];
 static uint64_t normalsSerial;
 static uint64_t depthSerial, frameSerial, commits, presents, draws;
 static NSUInteger depthArea;
@@ -106,6 +108,7 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
                     candidate.height==tex.height && candidate.sampleCount==1) {
                     currentNormals=candidate;
                     normalsSerial=frameSerial;
+                    for (NSUInteger slot=0; slot<4; ++slot) currentGBuffer[slot]=desc.colorAttachments[slot].texture;
                     break;
                 }
             }
@@ -124,7 +127,7 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
 static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
     NSString *label = cb.label ?: @"<no label>";
     id<CAMetalDrawable> drawable = nil;
-    id<MTLTexture> depth = nil, normals = nil;
+    id<MTLTexture> depth = nil, normals = nil, gbuffer[4] = {nil};
     FrameProcessor effect = NULL;
     os_unfair_lock_lock(&stateLock);
     commits++;
@@ -133,7 +136,10 @@ static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
         presents++;
         drawable = currentDrawable;
         depth = depthSerial == frameSerial ? currentDepth : nil;
-        if (depth && normalsSerial == frameSerial && currentNormals.width == depth.width && currentNormals.height == depth.height) normals = currentNormals;
+        if (depth && normalsSerial == frameSerial && currentNormals.width == depth.width && currentNormals.height == depth.height) {
+            normals = currentNormals;
+            for (NSUInteger slot=0; slot<4; ++slot) gbuffer[slot]=currentGBuffer[slot];
+        }
         effect = processor;
         frameSerial++;
         depthArea=0;
@@ -143,8 +149,10 @@ static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
     if (effect && drawable && !drawable.texture.framebufferOnly) {
         insideProcessor = YES;
         frameNormals = normals;
+        for (NSUInteger slot=0; slot<4; ++slot) frameGBuffer[slot]=gbuffer[slot];
         effect(cb, drawable.texture, depth);
         frameNormals = nil;
+        for (NSUInteger slot=0; slot<4; ++slot) frameGBuffer[slot]=nil;
         insideProcessor = NO;
     }
     ((void (*)(id, SEL))originalCommit)(cb, sel);
@@ -161,6 +169,12 @@ __attribute__((visibility("default"))) void SMOSetFrameProcessor(FrameProcessor 
 // the frame processor.
 __attribute__((visibility("default"))) id<MTLTexture> SMOFrameNormals(void) {
     return insideProcessor ? frameNormals : nil;
+}
+
+// A color target of the G-buffer pass of the frame being presented. Valid
+// only inside the frame processor.
+__attribute__((visibility("default"))) id<MTLTexture> SMOFrameGBuffer(NSUInteger slot) {
+    return insideProcessor && slot<4 ? frameGBuffer[slot] : nil;
 }
 
 __attribute__((visibility("default"))) const char *SMOBridgeStatus(void) {
