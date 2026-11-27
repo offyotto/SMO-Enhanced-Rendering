@@ -210,17 +210,32 @@ kernel void normalFit(device NormalFit &fit [[buffer(0)]],const device NormalFit
     fit.columns[2]=float4(m[2],0);
     fit.valid=float4(valid ? 1 : 0,total,valid ? agreement/total : 0,0);
 }
-// Stores the view-space normal xy at the size of hierarchy mip 0, so a later
-// present can read the normals that match its color. (1,1) marks no normal.
+// Stores the view-space normal at the size of hierarchy mip 0, so a later
+// present can read the normals that match its color. Red holds x/4, plus .75
+// when z is positive; green holds y. Red of -1 marks no normal.
 kernel void normalView(texture2d<float,access::read> normals [[texture(0)]],
-    texture2d<float,access::write> target [[texture(1)]],const device NormalFit &fit [[buffer(0)]],
-    uint2 tid [[thread_position_in_grid]]) {
+    texture2d<float,access::write> target [[texture(1)]],depth2d<float,access::read> depth [[texture(2)]],
+    const device NormalFit &fit [[buffer(0)]],uint2 tid [[thread_position_in_grid]]) {
     uint2 dstSize=uint2(target.get_width(),target.get_height());
     if (any(tid>=dstSize)) return;
-    float2 e=normals.read(tid*uint2(normals.get_width(),normals.get_height())/dstSize).rg;
+    uint2 srcSize=uint2(normals.get_width(),normals.get_height());
+    uint2 source=tid;
+    if (any(srcSize!=dstSize)) {
+        // Take the normal of the texel whose depth depthHierarchyShrink kept.
+        uint2 first=tid*srcSize/dstSize;
+        uint2 end=((tid+1)*srcSize+dstSize-1)/dstSize;
+        source=first;
+        float closest=2.0;
+        for (uint y=first.y;y<end.y;++y)
+            for (uint x=first.x;x<end.x;++x) {
+                float d=depth.read(uint2(x,y));
+                if (isfinite(d)&&d>.001&&d<closest) { closest=d; source=uint2(x,y); }
+            }
+    }
+    float2 e=normals.read(source).rg;
     float3 n=float3x3(fit.columns[0].xyz,fit.columns[1].xyz,fit.columns[2].xyz)*decodeNormal(e);
     bool valid=fit.valid.x>.5 && any(e!=float2(0));
-    target.write(float4(valid ? n.xy : float2(1),0,0),tid);
+    target.write(float4(valid ? float2(n.x*.25+(n.z>0 ? .75 : 0.0),n.y) : float2(-1),0,0),tid);
 }
 MaterialInfo classifyMaterial(float3 base,GeometryInfo geometry) {
     float maxC=max(max(base.r,base.g),base.b);
@@ -548,8 +563,10 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     // The game's own normal replaces the depth-derived one where it exists.
     // It carries the normal maps and has no facets or silhouette errors.
     float2 stored=normals.sample(depthSampler,uv).rg;
-    if (s.normalsAvailable>.5 && dot(stored,stored)<1.2 && debug!=10) {
-        float3 g=float3(stored,-sqrt(max(1-dot(stored,stored),0.0)));
+    if (s.normalsAvailable>.5 && stored.x>-.5 && debug!=10) {
+        bool away=stored.x>.375;
+        float2 xy=float2((away ? stored.x-.75 : stored.x)*4,stored.y);
+        float3 g=float3(xy,sqrt(max(1-dot(xy,xy),0.0))*(away ? 1.0 : -1.0));
         float3 toEye=-normalize(p);
         // Keep a normal-mapped normal on the visible side of the surface.
         g=normalize(g+toEye*max(.05-dot(g,toEye),0.0));

@@ -238,7 +238,7 @@ enum { NormalFitBytes=64, NormalFitRows=22 };
 // Fits the camera rotation for this present's normals and stores them in
 // view space. The previous slot supplies the prior for the fit.
 static BOOL BuildNormals(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFrame *frame, ShaderFrame *previous,
-                         id<MTLTexture> normals, const ShaderSettings *settings) {
+                         id<MTLTexture> normals, id<MTLTexture> depth, const ShaderSettings *settings) {
     id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
     if (!enc) return NO;
     enc.label=@"SMO normal fit";
@@ -254,6 +254,7 @@ static BOOL BuildNormals(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFrame 
     [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
     [enc setComputePipelineState:p.normalView];
     [enc setTexture:frame.normals atIndex:1];
+    [enc setTexture:depth atIndex:2];
     [enc dispatchThreads:MTLSizeMake(frame.normals.width,frame.normals.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [enc endEncoding];
     return YES;
@@ -453,7 +454,7 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
         if (freshDepth && !BuildHierarchy(cb,p,frame,depth)) {
             EncodingFailed(p,@"Metal depth-hierarchy encoder creation failed"); return;
         }
-        if (guestNormals && !BuildNormals(cb,p,frame,previous,guestNormals,&settings)) {
+        if (guestNormals && !BuildNormals(cb,p,frame,previous,guestNormals,depth,&settings)) {
             EncodingFailed(p,@"Metal normal encoder creation failed"); return;
         }
         if (capture) EncodeCapture(cb,color,frame.hierarchyMips[0],previousUsable ? previous.hierarchyMips[0] : nil,guestNormals);
