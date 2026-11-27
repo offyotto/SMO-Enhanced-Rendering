@@ -27,6 +27,8 @@ The surface passes skip the HUD regions. Each pixel rotates its occlusion sample
 ## Depth alignment
 
 At a present, the guest depth buffer is one present ahead of the color on screen. Live captures show the offset: depth silhouettes lead the image during motion, and occlusion and reflections appear beside a moving character.
+`gameNormals` (default `true`) shades with the game's own G-buffer normals. The bridge picks the `RG16Snorm` color attachment drawn together with the scene depth; it holds world-space normals, octahedral-encoded. No camera matrix is available, so each present fits the world-to-view rotation by matching a 40x22 grid of those normals against normals derived from depth, and stores view-space normals next to the depth hierarchy. A fit that agrees less than 90% with the depth normals is rejected and that frame falls back to depth-derived normals. The log reports `gameNormals=` and the fit agreement.
+
 `depthDelay` (default `1`) pairs each frame with the depth hierarchy that the previous present built. Set it to `0` for the earlier behavior.
 
 To check the alignment in a running game, create an empty file named `capture-request` beside the preset. The next frame writes the unprocessed color, the current depth, and the previous depth to `align-capture/`.
@@ -61,13 +63,13 @@ The active preset is here:
 
 `~/Library/Containers/V380-Ori.Astris/Data/Documents/SMOShaders/preset.json`
 
-The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, `effectWidth`, `depthDelay`, `halfResolution`, `adaptivePower`, `debugView`, and `debugMip`. Each debug view shades at the full effect size.
+The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, `effectWidth`, `depthDelay`, `gameNormals`, `halfResolution`, `adaptivePower`, `debugView`, and `debugMip`. Each debug view shades at the full effect size.
 
 Hi-Z debug modes:
 
 - `debugView: 0` — normal composite.
 - `debugView: 1` — reconstructed view-space depth.
-- `debugView: 2` — reconstructed normals.
+- `debugView: 2` — the normals in use: the game's where available, otherwise reconstructed from depth.
 - `debugView: 3` — SSR hit confidence.
 - `debugView: 4` — guest depth as the shaders read it: mip 0 of the hierarchy, with invalid values replaced by 1.
 - `debugView: 5` — depth-hierarchy visualization. Select mip `0` through `6` with `debugMip`.
@@ -75,6 +77,7 @@ Hi-Z debug modes:
 - `debugView: 7` — reflected radiance before final compositing.
 - `debugView: 8` — trace termination/rejection reason.
 - `debugView: 9` — material diagnostics: red = reflection weight, green = roughness, blue = surface trust.
+- `debugView: 10` — normals reconstructed from depth, for comparison with view 2.
 
 `debugView: 8` colors are: green = accepted hit, red = rejected candidate, blue = screen edge, purple = depth/far-depth rejection, yellow = low material weight, magenta = traversal budget, brown = unstable geometry, cyan = HDR/transparent-color rejection, gray = fresh depth or hierarchy unavailable.
 

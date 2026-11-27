@@ -35,7 +35,7 @@ typedef void (*FrameProcessor)(id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTextu
 @property id<MTLDevice> device;
 @property id<MTLLibrary> library;
 @property id<MTLRenderPipelineState> surface, resolve, extract, blur, composite;
-@property id<MTLComputePipelineState> hierarchyCopy, hierarchyShrink, hierarchyReduce, normalFit, normalView;
+@property id<MTLComputePipelineState> hierarchyCopy, hierarchyShrink, hierarchyReduce, normalRows, normalFit, normalView;
 @property NSMutableArray<ShaderFrame *> *frames;
 @property ShaderSettings settings;
 @property NSUInteger effectWidth, depthDelay;
@@ -154,10 +154,11 @@ static BOOL LoadProgram(void) {
         if (p.composite) p.hierarchyCopy=ComputePipeline(p,@"depthHierarchyCopy",&error);
         if (p.hierarchyCopy) p.hierarchyShrink=ComputePipeline(p,@"depthHierarchyShrink",&error);
         if (p.hierarchyShrink) p.hierarchyReduce=ComputePipeline(p,@"depthHierarchyReduce",&error);
-        if (p.hierarchyReduce) p.normalFit=ComputePipeline(p,@"normalFit",&error);
+        if (p.hierarchyReduce) p.normalRows=ComputePipeline(p,@"normalRows",&error);
+        if (p.normalRows) p.normalFit=ComputePipeline(p,@"normalFit",&error);
         if (p.normalFit) p.normalView=ComputePipeline(p,@"normalView",&error);
     }
-    if (!p.surface || !p.resolve || !p.extract || !p.blur || !p.composite || !p.hierarchyCopy || !p.hierarchyShrink || !p.hierarchyReduce || !p.normalFit || !p.normalView) {
+    if (!p.surface || !p.resolve || !p.extract || !p.blur || !p.composite || !p.hierarchyCopy || !p.hierarchyShrink || !p.hierarchyReduce || !p.normalRows || !p.normalFit || !p.normalView) {
         [lock lock];
         lastError=error.description ?: @"Shader pipeline creation failed";
         Log(lastError);
@@ -232,6 +233,8 @@ static BOOL UsableNormals(id<MTLTexture> normals, id<MTLTexture> depth, id<MTLDe
         normals.storageMode!=MTLStorageModeMemoryless &&
         (normals.usage==MTLTextureUsageUnknown || (normals.usage&MTLTextureUsageShaderRead));
 }
+// Must match NormalFit and fitGrid.y in Cinematic.metal.
+enum { NormalFitBytes=64, NormalFitRows=22 };
 // Fits the camera rotation for this present's normals and stores them in
 // view space. The previous slot supplies the prior for the fit.
 static BOOL BuildNormals(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFrame *frame, ShaderFrame *previous,
@@ -239,12 +242,15 @@ static BOOL BuildNormals(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFrame 
     id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
     if (!enc) return NO;
     enc.label=@"SMO normal fit";
-    [enc setComputePipelineState:p.normalFit];
+    [enc setComputePipelineState:p.normalRows];
     [enc setTexture:normals atIndex:0];
     [enc setTexture:frame.hierarchyMips[0] atIndex:1];
     [enc setBuffer:frame.normalFit offset:0 atIndex:0];
     [enc setBuffer:previous.normalFit ?: frame.normalFit offset:0 atIndex:1];
     [enc setBytes:settings length:sizeof(*settings) atIndex:2];
+    [enc setBuffer:frame.normalFit offset:NormalFitBytes atIndex:3];
+    [enc dispatchThreads:MTLSizeMake(1,NormalFitRows,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+    [enc setComputePipelineState:p.normalFit];
     [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
     [enc setComputePipelineState:p.normalView];
     [enc setTexture:frame.normals atIndex:1];
@@ -402,7 +408,7 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
             frame.normals=[p.device newTextureWithDescriptor:nd];
             frame.normals.label=@"SMO view-space normals";
             // A zeroed buffer is an invalid fit.
-            if (!frame.normalFit) frame.normalFit=[p.device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+            if (!frame.normalFit) frame.normalFit=[p.device newBufferWithLength:NormalFitBytes*(1+NormalFitRows) options:MTLResourceStorageModeShared];
             frame.hasNormals=NO;
         }
         if (!frame.normals || !frame.normalFit) hierarchyReady=NO;

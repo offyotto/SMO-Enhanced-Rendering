@@ -156,17 +156,17 @@ struct NormalFit {
 };
 constant uint2 fitGrid=uint2(40,22);
 // The camera matrix is not available, so fit the rotation that maps the
-// game's normals onto normals derived from depth, over a sparse grid. The
-// previous fit steadies a frame with too few distinct surfaces.
-kernel void normalFit(texture2d<float,access::read> normals [[texture(0)]],DepthTexture depth [[texture(1)]],
-    device NormalFit &fit [[buffer(0)]],const device NormalFit &prior [[buffer(1)]],constant Settings &s [[buffer(2)]],
+// game's normals onto normals derived from depth, over a sparse grid. Each
+// thread sums one grid row so the fit does not run serially.
+kernel void normalRows(texture2d<float,access::read> normals [[texture(0)]],DepthTexture depth [[texture(1)]],
+    device NormalFit *rows [[buffer(3)]],constant Settings &s [[buffer(2)]],
     uint2 tid [[thread_position_in_grid]]) {
-    if (any(tid>uint2(0))) return;
+    if (tid.x>0 || tid.y>=fitGrid.y) return;
     uint2 size=uint2(normals.get_width(),normals.get_height());
     float3x3 m=float3x3(0);
     float total=0;
-    for (uint i=0;i<fitGrid.x*fitGrid.y;++i) {
-        float2 uv=(float2(i%fitGrid.x,i/fitGrid.x)+.5)/float2(fitGrid);
+    for (uint x=0;x<fitGrid.x;++x) {
+        float2 uv=(float2(x,tid.y)+.5)/float2(fitGrid);
         if (depthAt(depth,uv)>.9993) continue;
         GeometryInfo g=geometryAt(depth,uv,positionAt(depth,uv,s),s);
         float w=g.continuity*(1-g.curvature);
@@ -175,8 +175,23 @@ kernel void normalFit(texture2d<float,access::read> normals [[texture(0)]],Depth
         m+=w*float3x3(g.normal*world.x,g.normal*world.y,g.normal*world.z);
         total+=w;
     }
-    bool hasPrior=prior.valid.x>.5;
-    if (hasPrior) m+=(.03*total+.001)*float3x3(prior.columns[0].xyz,prior.columns[1].xyz,prior.columns[2].xyz);
+    rows[tid.y].columns[0]=float4(m[0],0);
+    rows[tid.y].columns[1]=float4(m[1],0);
+    rows[tid.y].columns[2]=float4(m[2],0);
+    rows[tid.y].valid=float4(total,0,0,0);
+}
+// The previous fit steadies a frame with too few distinct surfaces.
+kernel void normalFit(device NormalFit &fit [[buffer(0)]],const device NormalFit &prior [[buffer(1)]],
+    const device NormalFit *rows [[buffer(3)]],uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid>uint2(0))) return;
+    float3x3 m=float3x3(0);
+    float total=0;
+    for (uint y=0;y<fitGrid.y;++y) {
+        m+=float3x3(rows[y].columns[0].xyz,rows[y].columns[1].xyz,rows[y].columns[2].xyz);
+        total+=rows[y].valid.x;
+    }
+    float3x3 measured=m;
+    if (prior.valid.x>.5) m+=(.03*total+.001)*float3x3(prior.columns[0].xyz,prior.columns[1].xyz,prior.columns[2].xyz);
     // Polar decomposition: the nearest orthogonal matrix.
     m*=1/max(sqrt(dot(m[0],m[0])+dot(m[1],m[1])+dot(m[2],m[2])),1e-9);
     bool valid=total>24;
@@ -186,17 +201,9 @@ kernel void normalFit(texture2d<float,access::read> normals [[texture(0)]],Depth
         if (abs(det)<1e-7) { valid=false; break; }
         m=.5*(m+cofactor*(1/det));
     }
-    // Accept the fit only when it reproduces the depth normals.
-    float agreement=0;
-    for (uint i=0;i<fitGrid.x*fitGrid.y && valid;++i) {
-        float2 uv=(float2(i%fitGrid.x,i/fitGrid.x)+.5)/float2(fitGrid);
-        if (depthAt(depth,uv)>.9993) continue;
-        GeometryInfo g=geometryAt(depth,uv,positionAt(depth,uv,s),s);
-        float w=g.continuity*(1-g.curvature);
-        if (w<.5) continue;
-        float3 world=decodeNormal(normals.read(min(uint2(uv*float2(size)),size-1)).rg);
-        agreement+=w*dot(m*world,g.normal);
-    }
+    // Accept the fit only when it reproduces the depth normals: the weighted
+    // mean of dot(m*world,depthNormal) is the trace of m^T*measured.
+    float agreement=dot(m[0],measured[0])+dot(m[1],measured[1])+dot(m[2],measured[2]);
     valid=valid && agreement>.90*total;
     fit.columns[0]=float4(m[0],0);
     fit.columns[1]=float4(m[1],0);

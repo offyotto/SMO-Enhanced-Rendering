@@ -9,6 +9,7 @@
   "verticalFov": 50.0,
   "effectWidth": 1280,
   "depthDelay": 1,
+  "gameNormals": true,
   "halfResolution": true,
   "adaptivePower": true,
   "debugView": 0,
