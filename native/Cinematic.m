@@ -352,6 +352,15 @@ static void EncodeCapture(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLT
         if (done.status!=MTLCommandBufferStatusCompleted) { Log(@"Alignment capture failed; nothing written."); return; }
         NSString *folder=[directory stringByAppendingPathComponent:@"align-capture"];
         [[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
+        // An optional file left by an earlier capture would belong to another frame.
+        NSMutableArray<NSString *> *stale=[NSMutableArray array];
+        if (!n) [stale addObject:@"normals.rg16s"];
+        if (!c) [stale addObject:@"depth-previous.r32f"];
+        for (NSUInteger slot=0; slot<4; ++slot) {
+            NSString *key=[NSString stringWithFormat:@"gbuffer-%lu",(unsigned long)slot];
+            if (!targetData[key]) [stale addObject:[key stringByAppendingString:@".bin"]];
+        }
+        for (NSString *name in stale) [[NSFileManager defaultManager] removeItemAtPath:[folder stringByAppendingPathComponent:name] error:nil];
         [[NSData dataWithBytesNoCopy:a.contents length:a.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"color.rgba16f"] atomically:YES];
         [[NSData dataWithBytesNoCopy:b.contents length:b.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"depth.r32f"] atomically:YES];
         if (n) [[NSData dataWithBytesNoCopy:n.contents length:n.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"normals.rg16s"] atomically:YES];
