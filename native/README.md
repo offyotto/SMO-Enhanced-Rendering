@@ -29,6 +29,8 @@ The surface passes skip the HUD regions. Each pixel rotates its occlusion sample
 At a present, the guest depth buffer is one present ahead of the color on screen. Live captures show the offset: depth silhouettes lead the image during motion, and occlusion and reflections appear beside a moving character.
 `gameNormals` (default `true`) shades with the game's own G-buffer normals. The bridge picks the `RG16Snorm` color attachment drawn together with the scene depth; it holds world-space normals, octahedral-encoded. No camera matrix is available, so each present fits the world-to-view rotation by matching a 40x22 grid of those normals against normals derived from depth, and stores view-space normals next to the depth hierarchy. A fit that agrees less than 90% with the depth normals is rejected and that frame falls back to depth-derived normals. The log reports `gameNormals=` and the fit agreement.
 
+`gameMaterials` (default `true`) takes reflectivity and roughness from the game instead of guessing them from color. The same pass has an `RGBA8Unorm` base-color target whose alpha packs two 4-bit fields: the high one is low on glass and polished metal and high on stone and cloth, and the low one is set on glass and metal. This reading comes from live captures, not from a format description. Where a flat stretch of depth faces away from the stored normal, something drawn after the G-buffer (water, for example) covers the surface, and that pixel keeps the depth normal and the color-based material. The one-shot capture also saves every color target of that pass as `gbuffer-N.bin`.
+
 `depthDelay` (default `1`) pairs each frame with the depth hierarchy that the previous present built. Set it to `0` for the earlier behavior.
 
 To check the alignment in a running game, create an empty file named `capture-request` beside the preset. The next frame writes the unprocessed color, the current depth, and the previous depth to `align-capture/`.
@@ -63,7 +65,7 @@ The active preset is here:
 
 `~/Library/Containers/V380-Ori.Astris/Data/Documents/SMOShaders/preset.json`
 
-The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, `effectWidth`, `depthDelay`, `gameNormals`, `halfResolution`, `adaptivePower`, `debugView`, and `debugMip`. Each debug view shades at the full effect size.
+The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, `effectWidth`, `depthDelay`, `gameNormals`, `gameMaterials`, `halfResolution`, `adaptivePower`, `debugView`, and `debugMip`. Each debug view shades at the full effect size.
 
 Hi-Z debug modes:
 

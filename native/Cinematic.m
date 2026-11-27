@@ -24,7 +24,7 @@ typedef void (*FrameProcessor)(id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTextu
 @property id<MTLTexture> low, surface, effects, bloomA, bloomB, depthHierarchy, normals;
 // The world-to-view rotation fitted for the normals of this slot.
 @property id<MTLBuffer> normalFit;
-@property BOOL hasNormals;
+@property BOOL hasNormals, hasMaterials;
 @property NSArray<id<MTLTexture>> *hierarchyMips;
 @property BOOL busy;
 @end
@@ -39,7 +39,7 @@ typedef void (*FrameProcessor)(id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTextu
 @property NSMutableArray<ShaderFrame *> *frames;
 @property ShaderSettings settings;
 @property NSUInteger effectWidth, depthDelay;
-@property BOOL enabled, adaptivePower, halfResolution, gameNormals;
+@property BOOL enabled, adaptivePower, halfResolution, gameNormals, gameMaterials;
 @property BOOL failed;
 @end
 @implementation ShaderProgram
@@ -88,6 +88,7 @@ static void UpdateSettings(ShaderProgram *p, NSDictionary *d) {
     p.depthDelay=(NSUInteger)Number(d,@"depthDelay",1,0,1);
     p.halfResolution=d[@"halfResolution"] ? [d[@"halfResolution"] boolValue] : YES;
     p.gameNormals=d[@"gameNormals"] ? [d[@"gameNormals"] boolValue] : YES;
+    p.gameMaterials=d[@"gameMaterials"] ? [d[@"gameMaterials"] boolValue] : YES;
     p.adaptivePower=d[@"adaptivePower"] ? [d[@"adaptivePower"] boolValue] : YES;
     p.enabled=d[@"enabled"] ? [d[@"enabled"] boolValue] : YES;
 }
@@ -228,18 +229,21 @@ static BOOL BuildHierarchy(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFram
     return YES;
 }
 // The game's G-buffer normals: an RG16Snorm target the size of the depth buffer.
-static BOOL UsableNormals(id<MTLTexture> normals, id<MTLTexture> depth, id<MTLDevice> device) {
-    return normals && normals.pixelFormat==MTLPixelFormatRG16Snorm && normals.width==depth.width && normals.height==depth.height &&
+static BOOL UsableTarget(id<MTLTexture> normals, id<MTLTexture> depth, id<MTLDevice> device) {
+    return normals && normals.width==depth.width && normals.height==depth.height &&
         normals.textureType==MTLTextureType2D && normals.sampleCount==1 && normals.device.registryID==device.registryID &&
         normals.storageMode!=MTLStorageModeMemoryless &&
         (normals.usage==MTLTextureUsageUnknown || (normals.usage&MTLTextureUsageShaderRead));
+}
+static BOOL UsableNormals(id<MTLTexture> normals, id<MTLTexture> depth, id<MTLDevice> device) {
+    return normals.pixelFormat==MTLPixelFormatRG16Snorm && UsableTarget(normals,depth,device);
 }
 // Must match NormalFit and fitGrid.y in Cinematic.metal.
 enum { NormalFitBytes=64, NormalFitRows=22 };
 // Fits the camera rotation for this present's normals and stores them in
 // view space. The previous slot supplies the prior for the fit.
 static BOOL BuildNormals(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFrame *frame, ShaderFrame *previous,
-                         id<MTLTexture> normals, id<MTLTexture> depth, const ShaderSettings *settings) {
+                         id<MTLTexture> normals, id<MTLTexture> material, id<MTLTexture> depth, const ShaderSettings *settings) {
     id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
     if (!enc) return NO;
     enc.label=@"SMO normal fit";
@@ -256,6 +260,9 @@ static BOOL BuildNormals(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFrame 
     [enc setComputePipelineState:p.normalView];
     [enc setTexture:frame.normals atIndex:1];
     [enc setTexture:depth atIndex:2];
+    [enc setTexture:material ?: normals atIndex:3];
+    uint32_t hasMaterial=material!=nil;
+    [enc setBytes:&hasMaterial length:sizeof(hasMaterial) atIndex:1];
     [enc dispatchThreads:MTLSizeMake(frame.normals.width,frame.normals.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [enc endEncoding];
     return YES;
@@ -409,6 +416,12 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
         heldFrame=nil;
         id<MTLTexture> guestNormals=p.gameNormals && freshDepth && frameNormals ? frameNormals() : nil;
         if (!UsableNormals(guestNormals,depth,p.device)) guestNormals=nil;
+        // The base-color target of the same pass; its alpha holds the material.
+        id<MTLTexture> guestMaterial=nil;
+        for (NSUInteger slot=0; slot<4 && guestNormals && p.gameMaterials && frameGBuffer && !guestMaterial; ++slot) {
+            id<MTLTexture> candidate=frameGBuffer(slot);
+            if (candidate.pixelFormat==MTLPixelFormatRGBA8Unorm && UsableTarget(candidate,depth,p.device)) guestMaterial=candidate;
+        }
         BOOL capture=captureRequested && freshDepth;
         if (capture) captureRequested=NO;
         for (ShaderFrame *candidate in p.frames) if (!candidate.busy && candidate!=previous) { frame=candidate; break; }
@@ -429,7 +442,7 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
             hierarchyReady=AllocateHierarchy(frame,p.device,hw,hh);
         }
         if (frame.normals.width!=hw || frame.normals.height!=hh) {
-            MTLTextureDescriptor *nd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Snorm width:hw height:hh mipmapped:NO];
+            MTLTextureDescriptor *nd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGB10A2Unorm width:hw height:hh mipmapped:NO];
             nd.storageMode=MTLStorageModePrivate;
             nd.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;
             frame.normals=[p.device newTextureWithDescriptor:nd];
@@ -456,9 +469,9 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
         settings.depthAvailable=usable ? 1.f : 0.f;
         settings.hierarchyLevels=usable ? (float)hierarchy.mipmapLevelCount : 0.f;
         ShaderFrame *source=delayed && previousUsable ? previous : frame;
-        if (freshDepth) frame.hasNormals=guestNormals!=nil;
+        if (freshDepth) { frame.hasNormals=guestNormals!=nil; frame.hasMaterials=guestMaterial!=nil; }
         id<MTLTexture> normals=source.normals;
-        settings.normalsAvailable=usable && source.hasNormals && p.gameNormals ? 1.f : 0.f;
+        settings.normalsAvailable=usable && source.hasNormals && p.gameNormals ? (source.hasMaterials && p.gameMaterials ? 2.f : 1.f) : 0.f;
         // Keep the slot reserved even if an encoder fails after commands were encoded.
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
             [lock lock];
@@ -470,7 +483,7 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
             // This duration covers the complete presentation command buffer, including guest work.
             if (frameCount==1 || frameCount==300 || frameCount%1800==0) {
                 const float *fit=frame.normalFit.contents;
-                Log([NSString stringWithFormat:@"frames=%llu presentCBms=%.3f errors=%llu skipped=%llu missingDepth=%llu gameNormals=%d fit=%.3f",frameCount,presentCBMilliseconds,errorCount,skippedFrames,missingDepthFrames,frame.hasNormals,frame.hasNormals ? fit[14] : 0]);
+                Log([NSString stringWithFormat:@"frames=%llu presentCBms=%.3f errors=%llu skipped=%llu missingDepth=%llu gameNormals=%d gameMaterials=%d fit=%.3f",frameCount,presentCBMilliseconds,errorCount,skippedFrames,missingDepthFrames,frame.hasNormals,frame.hasMaterials,frame.hasNormals ? fit[14] : 0]);
             }
             [lock unlock];
         }];
@@ -480,7 +493,7 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
         if (freshDepth && !BuildHierarchy(cb,p,frame,depth)) {
             EncodingFailed(p,@"Metal depth-hierarchy encoder creation failed"); return;
         }
-        if (guestNormals && !BuildNormals(cb,p,frame,previous,guestNormals,depth,&settings)) {
+        if (guestNormals && !BuildNormals(cb,p,frame,previous,guestNormals,guestMaterial,depth,&settings)) {
             EncodingFailed(p,@"Metal normal encoder creation failed"); return;
         }
         if (capture) EncodeCapture(cb,color,frame.hierarchyMips[0],previousUsable ? previous.hierarchyMips[0] : nil,guestNormals);
@@ -539,6 +552,8 @@ __attribute__((visibility("default"))) void SMOShadersReload(void) {
 #ifdef SMO_COMPILE_ONLY
 static id<MTLTexture> testNormals;
 static id<MTLTexture> TestNormals(void) { return testNormals; }
+static id<MTLTexture> testMaterial;
+static id<MTLTexture> TestGBuffer(NSUInteger slot) { return slot==3 ? testMaterial : nil; }
 int main(int argc, const char **argv) {
     @autoreleasepool {
         directory=argc>1 ? @(argv[1]) : @".";
@@ -573,6 +588,16 @@ int main(int argc, const char **argv) {
             id<MTLBuffer> normalBuffer=[device newBufferWithBytes:normalData.bytes length:normalData.length options:MTLResourceStorageModeShared];
             [blit copyFromBuffer:normalBuffer sourceOffset:0 sourceBytesPerRow:ns sourceBytesPerImage:ns*dh sourceSize:MTLSizeMake(dw,dh,1) toTexture:testNormals destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
             frameNormals=TestNormals;
+            // gbuffer-3.bin is the game's base-color target, tightly packed.
+            NSData *materialData=[NSData dataWithContentsOfFile:[captureDir stringByAppendingPathComponent:@"gbuffer-3.bin"]];
+            if (materialData.length==dw*4*dh) {
+                MTLTextureDescriptor *md=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:dw height:dh mipmapped:NO];
+                md.storageMode=MTLStorageModePrivate;
+                testMaterial=[device newTextureWithDescriptor:md];
+                id<MTLBuffer> materialBuffer=[device newBufferWithBytes:materialData.bytes length:materialData.length options:MTLResourceStorageModeShared];
+                [blit copyFromBuffer:materialBuffer sourceOffset:0 sourceBytesPerRow:dw*4 sourceBytesPerImage:dw*4*dh sourceSize:MTLSizeMake(dw,dh,1) toTexture:testMaterial destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                frameGBuffer=TestGBuffer;
+            }
         }
         [blit copyFromBuffer:colorBuffer sourceOffset:0 sourceBytesPerRow:cs sourceBytesPerImage:cs*ch sourceSize:MTLSizeMake(cw,ch,1) toTexture:color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
         [blit copyFromBuffer:depthBuffer sourceOffset:0 sourceBytesPerRow:ds sourceBytesPerImage:ds*dh sourceSize:MTLSizeMake(dw,dh,1) toTexture:depth destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];

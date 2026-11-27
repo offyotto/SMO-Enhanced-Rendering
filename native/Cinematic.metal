@@ -211,11 +211,13 @@ kernel void normalFit(device NormalFit &fit [[buffer(0)]],const device NormalFit
     fit.valid=float4(valid ? 1 : 0,total,valid ? agreement/total : 0,0);
 }
 // Stores the view-space normal at the size of hierarchy mip 0, so a later
-// present can read the normals that match its color. Red holds x/4, plus .75
-// when z is positive; green holds y. Red of -1 marks no normal.
+// present can read the normals that match its color. Red and green hold xy,
+// blue the game's material byte, alpha 0 for no normal, 1/3 for negative z
+// and 2/3 for positive z.
 kernel void normalView(texture2d<float,access::read> normals [[texture(0)]],
     texture2d<float,access::write> target [[texture(1)]],depth2d<float,access::read> depth [[texture(2)]],
-    const device NormalFit &fit [[buffer(0)]],uint2 tid [[thread_position_in_grid]]) {
+    texture2d<float,access::read> material [[texture(3)]],const device NormalFit &fit [[buffer(0)]],
+    constant uint &hasMaterial [[buffer(1)]],uint2 tid [[thread_position_in_grid]]) {
     uint2 dstSize=uint2(target.get_width(),target.get_height());
     if (any(tid>=dstSize)) return;
     uint2 srcSize=uint2(normals.get_width(),normals.get_height());
@@ -235,7 +237,22 @@ kernel void normalView(texture2d<float,access::read> normals [[texture(0)]],
     float2 e=normals.read(source).rg;
     float3 n=float3x3(fit.columns[0].xyz,fit.columns[1].xyz,fit.columns[2].xyz)*decodeNormal(e);
     bool valid=fit.valid.x>.5 && any(e!=float2(0));
-    target.write(float4(valid ? float2(n.x*.25+(n.z>0 ? .75 : 0.0),n.y) : float2(-1),0,0),tid);
+    float packed=hasMaterial!=0 ? material.read(source).a : 0.0;
+    target.write(float4(n.xy*.5+.5,packed,valid ? (n.z>0 ? 2.0/3.0 : 1.0/3.0) : 0.0),tid);
+}
+// The alpha of the game's base-color target packs two 4-bit fields. Live
+// captures show the high one low on glass and polished metal and high on
+// stone and cloth, and the low one set on glass and metal.
+MaterialInfo gameMaterial(float packed) {
+    uint bits=uint(packed*255+.5);
+    float roughness=float(bits>>4)/15,specular=float(bits&15)/15;
+    MaterialInfo info;
+    // The game already draws an environment map on its mirrors, and a screen
+    // only holds part of what they should show, so keep them partial and
+    // rough enough for the half-size pass, which hides the missing parts.
+    info.roughness=clamp(roughness,.32,.90);
+    info.weight=mix(.22,.55,specular)*pow(1-roughness,1.5);
+    return info;
 }
 MaterialInfo classifyMaterial(float3 base,GeometryInfo geometry) {
     float maxC=max(max(base.r,base.g),base.b);
@@ -555,22 +572,32 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     // The detail pass shades only mirror-like surfaces. Curvature only adds
     // roughness, so a flat-surface estimate rejects whole rough regions here,
     // before any further depth read.
+    float4 stored=normals.sample(depthSampler,uv);
+    bool hasGame=s.normalsAvailable>.5 && stored.a>.2 && debug!=10;
+    bool hasMaterial=hasGame && s.normalsAvailable>1.5;
     if (mode==SurfaceDetail) {
         GeometryInfo flat={float3(0,0,-1),1,0};
-        if (classifyMaterial(base,flat).roughness>=detailRoughness.y) return output;
+        if (classifyMaterial(base,flat).roughness>=detailRoughness.y &&
+            (!hasMaterial || gameMaterial(stored.b).roughness>=detailRoughness.y)) return output;
     }
     GeometryInfo geometry=geometryAt(hierarchy,uv,p,s);
     // The game's own normal replaces the depth-derived one where it exists.
     // It carries the normal maps and has no facets or silhouette errors.
-    float2 stored=normals.sample(depthSampler,uv).rg;
-    if (s.normalsAvailable>.5 && stored.x>-.5 && debug!=10) {
-        bool away=stored.x>.375;
-        float2 xy=float2((away ? stored.x-.75 : stored.x)*4,stored.y);
-        float3 g=float3(xy,sqrt(max(1-dot(xy,xy),0.0))*(away ? 1.0 : -1.0));
-        float3 toEye=-normalize(p);
-        // Keep a normal-mapped normal on the visible side of the surface.
-        g=normalize(g+toEye*max(.05-dot(g,toEye),0.0));
-        geometry.normal=g;
+    if (hasGame) {
+        float2 xy=stored.rg*2-1;
+        float3 g=float3(xy,sqrt(max(1-dot(xy,xy),0.0))*(stored.a>.5 ? 1.0 : -1.0));
+        // The G-buffer holds opaque surfaces only. Where a flat stretch of
+        // depth faces another way, something drawn later, such as water,
+        // covers the surface, so its normal and material do not apply.
+        if (geometry.continuity>.8 && geometry.curvature<.2 && dot(g,geometry.normal)<.5) {
+            hasGame=false;
+            hasMaterial=false;
+        } else {
+            float3 toEye=-normalize(p);
+            // Keep a normal-mapped normal on the visible side of the surface.
+            g=normalize(g+toEye*max(.05-dot(g,toEye),0.0));
+            geometry.normal=g;
+        }
     }
     float3 n=geometry.normal;
     float farTrust=farDepthTrust(centerDepth);
@@ -609,6 +636,7 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     bounce*=.035*min(s.occlusion,1.0)*surfaceTrust*geometry.continuity;
 
     MaterialInfo materialInfo=classifyMaterial(base,geometry);
+    if (hasMaterial) materialInfo=gameMaterial(stored.b);
     float3 view=normalize(p);
     float fresnel=.20+.80*pow(1-clamp(dot(n,-view),0.0,1.0),4.0);
     float roughEnergy=mix(1.0,.72,materialInfo.roughness);
