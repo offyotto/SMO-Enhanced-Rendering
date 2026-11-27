@@ -24,6 +24,13 @@ The current SSR path builds a conservative R32Float closest-depth hierarchy with
 
 The surface passes skip the HUD regions. Each pixel rotates its occlusion samples, which removes the fixed pattern of the earlier version.
 
+## Depth alignment
+
+At a present, the guest depth buffer is one present ahead of the color on screen. Live captures show the offset: depth silhouettes lead the image during motion, and occlusion and reflections appear beside a moving character.
+`depthDelay` (default `1`) pairs each frame with the depth hierarchy that the previous present built. Set it to `0` for the earlier behavior.
+
+To check the alignment in a running game, create an empty file named `capture-request` beside the preset. The next frame writes the unprocessed color, the current depth, and the previous depth to `align-capture/`.
+
 ## Power use
 
 GPU time of the shader passes on an M1 Pro, measured with `cinematic-test` on two captured frames at a 3566x2006 output:
@@ -54,7 +61,7 @@ The active preset is here:
 
 `~/Library/Containers/V380-Ori.Astris/Data/Documents/SMOShaders/preset.json`
 
-The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, `effectWidth`, `halfResolution`, `adaptivePower`, `debugView`, and `debugMip`. Each debug view shades at the full effect size.
+The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, `effectWidth`, `depthDelay`, `halfResolution`, `adaptivePower`, `debugView`, and `debugMip`. Each debug view shades at the full effect size.
 
 Hi-Z debug modes:
 

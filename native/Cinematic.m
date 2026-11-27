@@ -35,7 +35,7 @@ typedef void (*FrameProcessor)(id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTextu
 @property id<MTLComputePipelineState> hierarchyCopy, hierarchyShrink, hierarchyReduce;
 @property NSMutableArray<ShaderFrame *> *frames;
 @property ShaderSettings settings;
-@property NSUInteger effectWidth;
+@property NSUInteger effectWidth, depthDelay;
 @property BOOL enabled, adaptivePower, halfResolution;
 @property BOOL failed;
 @end
@@ -48,6 +48,9 @@ static NSString *directory;
 static dispatch_source_t timer;
 static id<MTLTexture> lastDepth;
 static uint64_t frameCount, errorCount, skippedFrames, missingDepthFrames;
+// The slot whose hierarchy the previous present built, for depthDelay.
+static ShaderFrame *heldFrame;
+static BOOL captureRequested;
 static double presentCBMilliseconds;
 static NSString *lastError = @"none";
 static FILE *logFile;
@@ -76,6 +79,7 @@ static void UpdateSettings(ShaderProgram *p, NSDictionary *d) {
     s.debugMip=Number(d,@"debugMip",0,0,6);
     p.settings=s;
     p.effectWidth=(NSUInteger)Number(d,@"effectWidth",960,480,1920);
+    p.depthDelay=(NSUInteger)Number(d,@"depthDelay",1,0,1);
     p.halfResolution=d[@"halfResolution"] ? [d[@"halfResolution"] boolValue] : YES;
     p.adaptivePower=d[@"adaptivePower"] ? [d[@"adaptivePower"] boolValue] : YES;
     p.enabled=d[@"enabled"] ? [d[@"enabled"] boolValue] : YES;
@@ -248,6 +252,40 @@ static BOOL Draw(id<MTLCommandBuffer> cb, id<MTLTexture> target, MTLLoadAction l
     [enc endEncoding];
     return YES;
 }
+// Writes the unprocessed color, this present's depth, and the previous
+// present's depth to align-capture/. The files show which depth matches the
+// presented color. Create the file capture-request beside the preset to arm it.
+static void EncodeCapture(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth, id<MTLTexture> previous) {
+    NSUInteger cs=(color.width*8+255)&~(NSUInteger)255, ds=(depth.width*4+255)&~(NSUInteger)255;
+    id<MTLBuffer> a=[color.device newBufferWithLength:cs*color.height options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b=[color.device newBufferWithLength:ds*depth.height options:MTLResourceStorageModeShared];
+    id<MTLBuffer> c=previous ? [color.device newBufferWithLength:ds*depth.height options:MTLResourceStorageModeShared] : nil;
+    id<MTLBlitCommandEncoder> blit=[cb blitCommandEncoder];
+    if (!a || !b || !blit) return;
+    MTLOrigin origin=MTLOriginMake(0,0,0);
+    MTLSize size=MTLSizeMake(depth.width,depth.height,1);
+    [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:MTLSizeMake(color.width,color.height,1) toBuffer:a destinationOffset:0 destinationBytesPerRow:cs destinationBytesPerImage:cs*color.height];
+    [blit copyFromTexture:depth sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:size toBuffer:b destinationOffset:0 destinationBytesPerRow:ds destinationBytesPerImage:ds*depth.height];
+    if (c) [blit copyFromTexture:previous sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:size toBuffer:c destinationOffset:0 destinationBytesPerRow:ds destinationBytesPerImage:ds*depth.height];
+    [blit endEncoding];
+    NSDictionary *info=@{@"colorWidth":@(color.width),@"colorHeight":@(color.height),@"colorStride":@(cs),
+        @"depthWidth":@(depth.width),@"depthHeight":@(depth.height),@"depthStride":@(ds),@"previousDepth":@(c!=nil)};
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        NSString *folder=[directory stringByAppendingPathComponent:@"align-capture"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
+        [[NSData dataWithBytesNoCopy:a.contents length:a.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"color.rgba16f"] atomically:YES];
+        [[NSData dataWithBytesNoCopy:b.contents length:b.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"depth.r32f"] atomically:YES];
+        if (c) [[NSData dataWithBytesNoCopy:c.contents length:c.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"depth-previous.r32f"] atomically:YES];
+        [[NSJSONSerialization dataWithJSONObject:info options:NSJSONWritingPrettyPrinted error:nil] writeToFile:[folder stringByAppendingPathComponent:@"capture.json"] atomically:YES];
+        Log(@"Alignment capture written to align-capture.");
+    }];
+}
+// Arms a capture when the request file exists, and removes the file.
+static void CheckCaptureRequest(void) {
+    NSString *request=[directory stringByAppendingPathComponent:@"capture-request"];
+    if (![[NSFileManager defaultManager] removeItemAtPath:request error:nil]) return;
+    [lock lock]; captureRequested=YES; [lock unlock];
+}
 static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth) {
     @autoreleasepool {
         if (!cb || color.pixelFormat!=MTLPixelFormatRGBA16Float || color.width<640 || !color.height ||
@@ -291,8 +329,12 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
         NSUInteger ew=MIN(effectWidth,depth.width), eh=MAX(1,(NSUInteger)round(ew/settings.aspect));
         NSUInteger bw=MAX(1,ew/2), bh=MAX(1,eh/2);
         ShaderFrame *frame=nil;
-        for (ShaderFrame *candidate in p.frames) if (!candidate.busy) { frame=candidate; break; }
-        if (!frame && p.frames.count<4) { frame=[ShaderFrame new]; [p.frames addObject:frame]; }
+        ShaderFrame *previous=heldFrame;
+        heldFrame=nil;
+        BOOL capture=captureRequested && freshDepth;
+        if (capture) captureRequested=NO;
+        for (ShaderFrame *candidate in p.frames) if (!candidate.busy && candidate!=previous) { frame=candidate; break; }
+        if (!frame && p.frames.count<5) { frame=[ShaderFrame new]; [p.frames addObject:frame]; }
         if (!frame) { skippedFrames++; [lock unlock]; return; }
         frame.busy=YES;
         [lock unlock];
@@ -313,8 +355,16 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
             [lock lock]; frame.busy=NO; p.failed=YES; lastError=@"Metal texture allocation failed"; [lock unlock];
             Log(lastError); return;
         }
-        id<MTLTexture> hierarchy=frame.depthHierarchy;
-        BOOL usable=freshDepth;
+        if (freshDepth) { [lock lock]; heldFrame=frame; [lock unlock]; }
+        // Live captures show that the guest depth at a present is one present
+        // ahead of the presented color. depthDelay 1 therefore reads the
+        // hierarchy that the previous present built, which matches the color.
+        // That command buffer precedes this one on the queue.
+        BOOL previousUsable=previous.depthHierarchy.width==hw && previous.depthHierarchy.height==hh;
+        BOOL delayed=p.depthDelay>0;
+        id<MTLTexture> hierarchy=delayed && previousUsable ? previous.depthHierarchy : frame.depthHierarchy;
+        BOOL usable=delayed ? previousUsable : freshDepth;
+        settings.depthAvailable=usable ? 1.f : 0.f;
         settings.hierarchyLevels=usable ? (float)hierarchy.mipmapLevelCount : 0.f;
         // Keep the slot reserved even if an encoder fails after commands were encoded.
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -334,6 +384,7 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
         if (freshDepth && !BuildHierarchy(cb,p,frame,depth)) {
             EncodingFailed(p,@"Metal depth-hierarchy encoder creation failed"); return;
         }
+        if (capture) EncodeCapture(cb,color,frame.hierarchyMips[0],previousUsable ? previous.hierarchyMips[0] : nil);
         if (usable || debug) {
             BOOL drawn;
             if (p.halfResolution && !debug) {
@@ -414,6 +465,14 @@ int main(int argc, const char **argv) {
         [blit copyFromBuffer:colorBuffer sourceOffset:0 sourceBytesPerRow:cs sourceBytesPerImage:cs*ch sourceSize:MTLSizeMake(cw,ch,1) toTexture:color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
         [blit copyFromBuffer:depthBuffer sourceOffset:0 sourceBytesPerRow:ds sourceBytesPerImage:ds*dh sourceSize:MTLSizeMake(dw,dh,1) toTexture:depth destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
         [blit endEncoding];
+        // With depthDelay 1 the first present only builds the hierarchy, so
+        // process the frame once and upload the color again.
+        ProcessFrame(cb,color,depth);
+        blit=[cb blitCommandEncoder];
+        [blit copyFromBuffer:colorBuffer sourceOffset:0 sourceBytesPerRow:cs sourceBytesPerImage:cs*ch sourceSize:MTLSizeMake(cw,ch,1) toTexture:color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+        [blit endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        cb=[queue commandBuffer];
         ProcessFrame(cb,color,depth);
         blit=[cb blitCommandEncoder];
         [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(cw,ch,1) toBuffer:colorBuffer destinationOffset:0 destinationBytesPerRow:cs destinationBytesPerImage:cs*ch];
@@ -429,6 +488,7 @@ int main(int argc, const char **argv) {
             id<MTLBuffer> pristine=[device newBufferWithBytes:colorData.bytes length:colorData.length options:MTLResourceStorageModeShared];
             double total=0, best=1e9;
             for (int i=0;i<frames;i++) {
+                if (i==frames/2) CheckCaptureRequest();
                 cb=[queue commandBuffer];
                 blit=[cb blitCommandEncoder];
                 [blit copyFromBuffer:pristine sourceOffset:0 sourceBytesPerRow:cs sourceBytesPerImage:cs*ch sourceSize:MTLSizeMake(cw,ch,1) toTexture:color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
@@ -465,6 +525,7 @@ __attribute__((constructor)) static void Install(void) {
             NSProcessInfo *process=NSProcessInfo.processInfo;
             BOOL reduced=process.thermalState>=NSProcessInfoThermalStateSerious || process.lowPowerModeEnabled;
             NSDictionary *settings=SettingsChanged() ? ReadSettings() : nil;
+            CheckCaptureRequest();
             [lock lock];
             reducedPower=reduced;
             if (settings) UpdateSettings(program,settings);

@@ -470,7 +470,10 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
 
     float ao=0;
     float3 bounce=0;
-    float radius=traceZ*.10;
+    // The sample disc spans .032 of the screen height, about .03*Z in view
+    // space. The falloff ends at that distance: a sample far in front of
+    // the surface, such as a character above the ground, casts nothing.
+    float radius=traceZ*.045;
     // Each pixel rotates the sample spiral. A fixed spiral stamps offset
     // copies of nearby silhouettes onto the ground; the rotation turns them
     // into grain, which the resolve pass removes.
@@ -484,7 +487,7 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
         float3 v=q-p;
         float distance=length(v);
         // The outer rings fade, so the kernel boundary leaves no outline.
-        float weight=max(dot(n,v/max(distance,.0001))-.075,0.0)*(1-smoothstep(radius*.25,radius,distance))*(1.5-1.2*scale*scale);
+        float weight=max(dot(n,v/max(distance,.0001))-.075,0.0)*(1-smoothstep(radius*.30,radius,distance))*(1.5-1.2*scale*scale);
         ao+=weight;
         if (weight>0) bounce+=clampIndirectSample(color.sample(linearSampler,sampleUV).rgb)*weight;
     }
