@@ -8,7 +8,8 @@
 typedef void (*FrameProcessor)(id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTexture>);
 static FrameProcessor processor;
 static id<CAMetalDrawable> currentDrawable;
-static id<MTLTexture> currentDepth;
+static id<MTLTexture> currentDepth, currentNormals, frameNormals;
+static uint64_t normalsSerial;
 static uint64_t depthSerial, frameSerial, commits, presents, draws;
 static NSUInteger depthArea;
 static os_unfair_lock stateLock = OS_UNFAIR_LOCK_INIT;
@@ -97,6 +98,17 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
             NSString *key = [NSString stringWithFormat:@"%p %lux%lu fmt=%lu type=%lu samples=%lu usage=%lu storage=%lu load=%lu store=%lu clear=%.9g label=%@", (__bridge void *)tex, tex.width, tex.height, tex.pixelFormat, tex.textureType, tex.sampleCount, tex.usage, tex.storageMode, desc.depthAttachment.loadAction, desc.depthAttachment.storeAction, desc.depthAttachment.clearDepth, tex.label];
             if (seenDepths.count < 120 && ![seenDepths containsObject:key]) { [seenDepths addObject:key]; Log([@"depth " stringByAppendingString:key]); }
             }
+            // The G-buffer pass writes world-space normals to an RG16Snorm
+            // target the size of its depth buffer.
+            for (NSUInteger i=0; i<4; ++i) {
+                id<MTLTexture> candidate=desc.colorAttachments[i].texture;
+                if (candidate && candidate.pixelFormat==MTLPixelFormatRG16Snorm && candidate.width==tex.width &&
+                    candidate.height==tex.height && candidate.sampleCount==1) {
+                    currentNormals=candidate;
+                    normalsSerial=frameSerial;
+                    break;
+                }
+            }
             float aspect = (float)tex.width / tex.height;
             if (tex.sampleCount == 1 && aspect > 1.70 && aspect < 1.85 && tex.width >= 640 && tex.width*tex.height >= depthArea) {
                 currentDepth = tex;
@@ -112,7 +124,7 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
 static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
     NSString *label = cb.label ?: @"<no label>";
     id<CAMetalDrawable> drawable = nil;
-    id<MTLTexture> depth = nil;
+    id<MTLTexture> depth = nil, normals = nil;
     FrameProcessor effect = NULL;
     os_unfair_lock_lock(&stateLock);
     commits++;
@@ -121,6 +133,7 @@ static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
         presents++;
         drawable = currentDrawable;
         depth = depthSerial == frameSerial ? currentDepth : nil;
+        if (depth && normalsSerial == frameSerial && currentNormals.width == depth.width && currentNormals.height == depth.height) normals = currentNormals;
         effect = processor;
         frameSerial++;
         depthArea=0;
@@ -129,7 +142,9 @@ static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
     os_unfair_lock_unlock(&stateLock);
     if (effect && drawable && !drawable.texture.framebufferOnly) {
         insideProcessor = YES;
+        frameNormals = normals;
         effect(cb, drawable.texture, depth);
+        frameNormals = nil;
         insideProcessor = NO;
     }
     ((void (*)(id, SEL))originalCommit)(cb, sel);
@@ -140,6 +155,12 @@ __attribute__((visibility("default"))) void SMOSetFrameProcessor(FrameProcessor 
     processor = callback;
     os_unfair_lock_unlock(&stateLock);
     Log(callback ? @"frame processor enabled" : @"frame processor disabled");
+}
+
+// The G-buffer normal target of the frame being presented. Valid only inside
+// the frame processor.
+__attribute__((visibility("default"))) id<MTLTexture> SMOFrameNormals(void) {
+    return insideProcessor ? frameNormals : nil;
 }
 
 __attribute__((visibility("default"))) const char *SMOBridgeStatus(void) {

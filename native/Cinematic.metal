@@ -1,4 +1,4 @@
-// settings-layout: 3
+// settings-layout: 4
 #include <metal_stdlib>
 using namespace metal;
 
@@ -20,7 +20,7 @@ struct Settings {
     float debugMip;
     float hierarchyLevels;
     float surfaceMode;   // SurfaceAll, SurfaceLow, or SurfaceDetail
-    float reserved;
+    float normalsAvailable;
 };
 struct GeometryInfo {
     float3 normal;
@@ -138,6 +138,82 @@ GeometryInfo geometryAt(DepthTexture depth,float2 uv,float3 p,constant Settings 
     info.continuity=clamp(continuity,0.0,1.0);
     info.curvature=clamp(curvature,0.0,1.0);
     return info;
+}
+// The game's G-buffer stores world-space normals, octahedral-encoded into
+// [0,1], in an RG16Snorm target.
+float3 decodeNormal(float2 e) {
+    float2 f=e*2-1;
+    float3 n=float3(f,1-abs(f.x)-abs(f.y));
+    float t=saturate(-n.z);
+    n.xy+=select(float2(t),float2(-t),n.xy>=0);
+    return normalize(n);
+}
+// World-to-view rotation, as columns. valid.x is 1 when the fit agrees with
+// the depth buffer.
+struct NormalFit {
+    float4 columns[3];
+    float4 valid;
+};
+constant uint2 fitGrid=uint2(40,22);
+// The camera matrix is not available, so fit the rotation that maps the
+// game's normals onto normals derived from depth, over a sparse grid. The
+// previous fit steadies a frame with too few distinct surfaces.
+kernel void normalFit(texture2d<float,access::read> normals [[texture(0)]],DepthTexture depth [[texture(1)]],
+    device NormalFit &fit [[buffer(0)]],const device NormalFit &prior [[buffer(1)]],constant Settings &s [[buffer(2)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid>uint2(0))) return;
+    uint2 size=uint2(normals.get_width(),normals.get_height());
+    float3x3 m=float3x3(0);
+    float total=0;
+    for (uint i=0;i<fitGrid.x*fitGrid.y;++i) {
+        float2 uv=(float2(i%fitGrid.x,i/fitGrid.x)+.5)/float2(fitGrid);
+        if (depthAt(depth,uv)>.9993) continue;
+        GeometryInfo g=geometryAt(depth,uv,positionAt(depth,uv,s),s);
+        float w=g.continuity*(1-g.curvature);
+        if (w<.5) continue;
+        float3 world=decodeNormal(normals.read(min(uint2(uv*float2(size)),size-1)).rg);
+        m+=w*float3x3(g.normal*world.x,g.normal*world.y,g.normal*world.z);
+        total+=w;
+    }
+    bool hasPrior=prior.valid.x>.5;
+    if (hasPrior) m+=(.03*total+.001)*float3x3(prior.columns[0].xyz,prior.columns[1].xyz,prior.columns[2].xyz);
+    // Polar decomposition: the nearest orthogonal matrix.
+    m*=1/max(sqrt(dot(m[0],m[0])+dot(m[1],m[1])+dot(m[2],m[2])),1e-9);
+    bool valid=total>24;
+    for (uint i=0;i<14 && valid;++i) {
+        float3x3 cofactor=float3x3(cross(m[1],m[2]),cross(m[2],m[0]),cross(m[0],m[1]));
+        float det=dot(m[0],cofactor[0]);
+        if (abs(det)<1e-7) { valid=false; break; }
+        m=.5*(m+cofactor*(1/det));
+    }
+    // Accept the fit only when it reproduces the depth normals.
+    float agreement=0;
+    for (uint i=0;i<fitGrid.x*fitGrid.y && valid;++i) {
+        float2 uv=(float2(i%fitGrid.x,i/fitGrid.x)+.5)/float2(fitGrid);
+        if (depthAt(depth,uv)>.9993) continue;
+        GeometryInfo g=geometryAt(depth,uv,positionAt(depth,uv,s),s);
+        float w=g.continuity*(1-g.curvature);
+        if (w<.5) continue;
+        float3 world=decodeNormal(normals.read(min(uint2(uv*float2(size)),size-1)).rg);
+        agreement+=w*dot(m*world,g.normal);
+    }
+    valid=valid && agreement>.90*total;
+    fit.columns[0]=float4(m[0],0);
+    fit.columns[1]=float4(m[1],0);
+    fit.columns[2]=float4(m[2],0);
+    fit.valid=float4(valid ? 1 : 0,total,valid ? agreement/total : 0,0);
+}
+// Stores the view-space normal xy at the size of hierarchy mip 0, so a later
+// present can read the normals that match its color. (1,1) marks no normal.
+kernel void normalView(texture2d<float,access::read> normals [[texture(0)]],
+    texture2d<float,access::write> target [[texture(1)]],const device NormalFit &fit [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    uint2 dstSize=uint2(target.get_width(),target.get_height());
+    if (any(tid>=dstSize)) return;
+    float2 e=normals.read(tid*uint2(normals.get_width(),normals.get_height())/dstSize).rg;
+    float3 n=float3x3(fit.columns[0].xyz,fit.columns[1].xyz,fit.columns[2].xyz)*decodeNormal(e);
+    bool valid=fit.valid.x>.5 && any(e!=float2(0));
+    target.write(float4(valid ? n.xy : float2(1),0,0),tid);
 }
 MaterialInfo classifyMaterial(float3 base,GeometryInfo geometry) {
     float maxC=max(max(base.r,base.g),base.b);
@@ -427,7 +503,7 @@ constant float2 detailRoughness=float2(.20,.30);
 // is occlusion minus reflection weight. Both terms stay linear under filtering.
 fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     texture2d<float> color [[texture(0)]],DepthTexture hierarchy [[texture(1)]],
-    constant Settings &s [[buffer(0)]]) {
+    texture2d<float> normals [[texture(2)]],constant Settings &s [[buffer(0)]]) {
     float2 uv=in.uv;
     uint debug=uint(s.debugView+.5);
     uint mode=debug==0 ? uint(s.surfaceMode+.5) : uint(SurfaceAll);
@@ -462,6 +538,16 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
         if (classifyMaterial(base,flat).roughness>=detailRoughness.y) return output;
     }
     GeometryInfo geometry=geometryAt(hierarchy,uv,p,s);
+    // The game's own normal replaces the depth-derived one where it exists.
+    // It carries the normal maps and has no facets or silhouette errors.
+    float2 stored=normals.sample(depthSampler,uv).rg;
+    if (s.normalsAvailable>.5 && dot(stored,stored)<1.2 && debug!=10) {
+        float3 g=float3(stored,-sqrt(max(1-dot(stored,stored),0.0)));
+        float3 toEye=-normalize(p);
+        // Keep a normal-mapped normal on the visible side of the surface.
+        g=normalize(g+toEye*max(.05-dot(g,toEye),0.0));
+        geometry.normal=g;
+    }
     float3 n=geometry.normal;
     float farTrust=farDepthTrust(centerDepth);
     float hdrTrust=hdrSurfaceTrust(base);
@@ -516,7 +602,7 @@ fragment float4 surfaceEffects(VertexOut in [[stage_in]],
     if (mode==SurfaceDetail) output.a-=1;
 
     if (debug==1) output=float4(float3(log2(p.z)/12),1);
-    if (debug==2) output=float4(n*.5+.5,1);
+    if (debug==2 || debug==10) output=float4(n*.5+.5,1);
     if (debug==3) output=float4(float3(hit.confidence),1);
     // Fixed scales permit comparisons across roughness and scenes. Red is all
     // hierarchy reads / 64, green is mip-0 reads / 64, blue is candidates / 8.
