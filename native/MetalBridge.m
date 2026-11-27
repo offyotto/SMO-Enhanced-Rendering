@@ -14,7 +14,9 @@ static NSUInteger depthArea;
 static os_unfair_lock stateLock = OS_UNFAIR_LOCK_INIT;
 static FILE *logFile;
 static IMP originalNext, originalRender, originalCommit;
-static NSMutableSet<NSString *> *seenDepths, *seenLabels;
+static NSMutableSet<NSString *> *seenLabels;
+static uintptr_t seenDepths[120];
+static NSUInteger seenDepthCount;
 static _Thread_local BOOL insideProcessor;
 
 static void Log(NSString *message) {
@@ -48,8 +50,16 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
         if (tex && tex.width >= 320 && tex.height >= 180) {
             os_unfair_lock_lock(&stateLock);
             draws++;
-            NSString *key = [NSString stringWithFormat:@"%p %lux%lu fmt=%lu type=%lu samples=%lu usage=%lu storage=%lu load=%lu store=%lu clear=%.9g label=%@", (__bridge void *)tex, tex.width, tex.height, tex.pixelFormat, tex.textureType, tex.sampleCount, tex.usage, tex.storageMode, desc.depthAttachment.loadAction, desc.depthAttachment.storeAction, desc.depthAttachment.clearDepth, tex.label];
-            if (seenDepths.count < 120 && ![seenDepths containsObject:key]) { [seenDepths addObject:key]; Log([@"depth " stringByAppendingString:key]); }
+            // This hook runs for every render pass. Format the diagnostic only
+            // for a depth target that the log has not recorded.
+            uintptr_t tag = (uintptr_t)(__bridge void *)tex | desc.depthAttachment.loadAction | desc.depthAttachment.storeAction << 2;
+            NSUInteger known = 0;
+            while (known < seenDepthCount && seenDepths[known] != tag) known++;
+            if (known == seenDepthCount && seenDepthCount < 120) {
+                seenDepths[seenDepthCount++] = tag;
+                NSString *key = [NSString stringWithFormat:@"%p %lux%lu fmt=%lu type=%lu samples=%lu usage=%lu storage=%lu load=%lu store=%lu clear=%.9g label=%@", (__bridge void *)tex, tex.width, tex.height, tex.pixelFormat, tex.textureType, tex.sampleCount, tex.usage, tex.storageMode, desc.depthAttachment.loadAction, desc.depthAttachment.storeAction, desc.depthAttachment.clearDepth, tex.label];
+                Log([@"depth " stringByAppendingString:key]);
+            }
             float aspect = (float)tex.width / tex.height;
             if (tex.sampleCount == 1 && aspect > 1.70 && aspect < 1.85 && tex.width >= 640 && tex.width*tex.height >= depthArea) {
                 currentDepth = tex;
@@ -63,14 +73,14 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
 }
 
 static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
-    NSString *label = cb.label ?: @"<no label>";
+    NSString *label = cb.label;
     id<CAMetalDrawable> drawable = nil;
     id<MTLTexture> depth = nil;
     FrameProcessor effect = NULL;
     os_unfair_lock_lock(&stateLock);
     commits++;
-    if (seenLabels.count < 30 && ![seenLabels containsObject:label]) { [seenLabels addObject:label]; Log([@"commit " stringByAppendingString:label]); }
-    if ([label containsString:@"vkQueuePresent"] || [label containsString:@"Present"]) {
+    if (seenLabels.count < 30 && ![seenLabels containsObject:label ?: @"<no label>"]) { [seenLabels addObject:label ?: @"<no label>"]; Log([@"commit " stringByAppendingString:label ?: @"<no label>"]); }
+    if (label && [label containsString:@"Present"]) {
         presents++;
         drawable = currentDrawable;
         depth = depthSerial == frameSerial ? currentDepth : nil;
@@ -108,7 +118,7 @@ __attribute__((constructor)) static void Install(void) {
         NSString *directory = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/SMOShaders"];
         [[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
         logFile = fopen([[directory stringByAppendingPathComponent:@"bridge.log"] fileSystemRepresentation], "a");
-        seenDepths = [NSMutableSet new]; seenLabels = [NSMutableSet new];
+        seenLabels = [NSMutableSet new];
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         id<MTLCommandQueue> queue = [device newCommandQueue];
         id<MTLCommandBuffer> cb = [queue commandBuffer];

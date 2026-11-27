@@ -145,7 +145,7 @@ def install():
     MOD.mkdir(parents=True, exist_ok=True)
     files = ['MetalBridge.m', 'Cinematic.m', 'Cinematic.metal', 'ShaderLoader.m', 'preset.json',
              'libSMOMetalBridge.dylib', 'libSMOCinematic.dylib', 'libSMOShaderLoader.dylib',
-             'install_shaders.py', 'shader_control.py', 'README.md',
+             'install_shaders.py', 'shader_control.py', 'build.sh', 'README.md',
              'Enable Shaders.command', 'Disable Shaders.command']
     for filename in files:
         atomic_copy(ROOT / filename, MOD / filename)
@@ -154,8 +154,21 @@ def install():
     print('Shader files:', MOD)
 
 
+def update():
+    """Replace the shader files of an existing installation. Astris stays untouched."""
+    if not MANIFEST.exists():
+        raise RuntimeError('The shader loader is not installed. Run the installer without options first.')
+    for filename in ['libSMOMetalBridge.dylib', 'libSMOCinematic.dylib', 'Cinematic.metal']:
+        atomic_copy(ROOT / filename, DATA / filename)
+    if '--preset' in sys.argv:
+        atomic_copy(ROOT / 'preset.json', DATA / 'preset.json')
+    print('Shader files updated. Restart Astris to load them.')
+
+
 if __name__ == '__main__':
     if '--restore' in sys.argv:
         restore()
+    elif '--update' in sys.argv:
+        update()
     else:
         install()
