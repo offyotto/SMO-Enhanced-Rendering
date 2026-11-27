@@ -62,7 +62,7 @@ Hi-Z debug modes:
 - `debugView: 1` — reconstructed view-space depth.
 - `debugView: 2` — reconstructed normals.
 - `debugView: 3` — SSR hit confidence.
-- `debugView: 4` — raw guest depth.
+- `debugView: 4` — guest depth as the shaders read it: mip 0 of the hierarchy, with invalid values replaced by 1.
 - `debugView: 5` — depth-hierarchy visualization. Select mip `0` through `6` with `debugMip`.
 - `debugView: 6` — traversal cost: red = total hierarchy reads / 64, green = mip-0 reads / 64, blue = candidate hits / 8.
 - `debugView: 7` — reflected radiance before final compositing.
