@@ -531,23 +531,26 @@ fragment float4 resolveEffects(VertexOut in [[stage_in]],texture2d<float> effect
     DepthTexture depth [[texture(1)]],texture2d<float> detail [[texture(2)]],constant Settings &s [[buffer(0)]]) {
     float4 center=effects.sample(linearSampler,in.uv);
     if (s.debugView>.5) return center;
-    bool halfSize=s.surfaceMode>.5;
-    float4 extra=halfSize ? detail.sample(linearSampler,in.uv) : float4(0);
+    float4 extra=s.surfaceMode>.5 ? detail.sample(linearSampler,in.uv) : float4(0);
     float raw=depthAt(depth,in.uv);
     if (raw>.99998) return center+extra;
     float centerZ=1/max(1-raw,.00002);
-    // A half-size source has no texel at this pixel's depth by default, so
-    // its unweighted center tap counts for little.
-    float total=halfSize ? .25 : 2;
-    float4 sum=center*total;
-    float2 spread=s.direction*(halfSize ? 1.0 : 1.5);
-    for (uint i=0;i<4;++i) {
-        float2 uv=in.uv+float2(i&1 ? 1 : -1,i&2 ? 1 : -1)*spread;
-        float w=depthSimilarity(depth,uv,centerZ,centerZ*.008);
-        sum+=effects.sample(linearSampler,uv)*w;
+    // Weigh each of the nine nearest source texels by its own depth. A
+    // filtered tap would mix texels from both sides of a silhouette.
+    int2 size=int2(effects.get_width(),effects.get_height());
+    float2 position=in.uv*float2(size)-.5;
+    int2 nearest=int2(floor(position+.5));
+    float4 sum=0;
+    float total=0;
+    for (int i=0;i<9;++i) {
+        int2 texel=clamp(nearest+int2(i%3-1,i/3-1),int2(0),size-1);
+        float2 offset=float2(texel)-position;
+        float w=exp(-.7*dot(offset,offset))*
+            depthSimilarity(depth,(float2(texel)+.5)/float2(size),centerZ,centerZ*.008);
+        sum+=effects.read(uint2(texel))*w;
         total+=w;
     }
-    return sum/total+extra;
+    return (total>.001 ? sum/total : center)+extra;
 }
 
 fragment float4 bloomExtract(VertexOut in [[stage_in]],texture2d<float> color [[texture(0)]],constant Settings &s [[buffer(0)]]) {
