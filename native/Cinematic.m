@@ -260,8 +260,9 @@ static void EncodeCapture(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLT
     id<MTLBuffer> a=[color.device newBufferWithLength:cs*color.height options:MTLResourceStorageModeShared];
     id<MTLBuffer> b=[color.device newBufferWithLength:ds*depth.height options:MTLResourceStorageModeShared];
     id<MTLBuffer> c=previous ? [color.device newBufferWithLength:ds*depth.height options:MTLResourceStorageModeShared] : nil;
+    if (!a || !b) return;
     id<MTLBlitCommandEncoder> blit=[cb blitCommandEncoder];
-    if (!a || !b || !blit) return;
+    if (!blit) return;
     MTLOrigin origin=MTLOriginMake(0,0,0);
     MTLSize size=MTLSizeMake(depth.width,depth.height,1);
     [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:MTLSizeMake(color.width,color.height,1) toBuffer:a destinationOffset:0 destinationBytesPerRow:cs destinationBytesPerImage:cs*color.height];
@@ -271,6 +272,7 @@ static void EncodeCapture(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLT
     NSDictionary *info=@{@"colorWidth":@(color.width),@"colorHeight":@(color.height),@"colorStride":@(cs),
         @"depthWidth":@(depth.width),@"depthHeight":@(depth.height),@"depthStride":@(ds),@"previousDepth":@(c!=nil)};
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.status!=MTLCommandBufferStatusCompleted) { Log(@"Alignment capture failed; nothing written."); return; }
         NSString *folder=[directory stringByAppendingPathComponent:@"align-capture"];
         [[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
         [[NSData dataWithBytesNoCopy:a.contents length:a.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"color.rgba16f"] atomically:YES];
@@ -283,7 +285,9 @@ static void EncodeCapture(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLT
 // Arms a capture when the request file exists, and removes the file.
 static void CheckCaptureRequest(void) {
     NSString *request=[directory stringByAppendingPathComponent:@"capture-request"];
-    if (![[NSFileManager defaultManager] removeItemAtPath:request error:nil]) return;
+    NSFileManager *files=[NSFileManager defaultManager];
+    BOOL folder=NO;
+    if (![files fileExistsAtPath:request isDirectory:&folder] || folder || ![files removeItemAtPath:request error:nil]) return;
     [lock lock]; captureRequested=YES; [lock unlock];
 }
 static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth) {
