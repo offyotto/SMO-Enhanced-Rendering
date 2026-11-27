@@ -17,6 +17,20 @@ static IMP originalNext, originalRender, originalCommit;
 static NSMutableSet<NSString *> *seenDepths, *seenColors, *seenLabels;
 static _Thread_local BOOL insideProcessor;
 
+// Tags of the attachments whose signature was already formatted.
+static uintptr_t seenColorTags[512], seenDepthTags[256];
+static NSUInteger seenColorTagCount, seenDepthTagCount;
+
+// Returns YES for a recorded tag. Records a new one while space remains;
+// after that every tag counts as recorded.
+static BOOL Known(uintptr_t *tags, NSUInteger *count, uintptr_t tag) {
+    NSUInteger capacity=tags==seenColorTags ? 512 : 256;
+    for (NSUInteger i=0; i<*count; i++) if (tags[i]==tag) return YES;
+    if (*count==capacity) return YES;
+    tags[(*count)++]=tag;
+    return NO;
+}
+
 static void Log(NSString *message) {
     if (logFile) { fprintf(logFile, "%s\n", message.UTF8String); fflush(logFile); }
 }
@@ -51,10 +65,14 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
         // eventually appear here because MoltenVK maps guest render targets to
         // Metal render-pass color attachments. We deliberately do not retain,
         // modify, or force-store anything yet; this first stage is observation.
-        for (NSUInteger i=0; i<8; ++i) {
+        // This hook runs for every guest render pass. Format a signature only
+        // for a texture that the log has not recorded, and stop reading the
+        // attachments once the log is full.
+        for (NSUInteger i=0; i<8 && seenColors.count < 240; ++i) {
             MTLRenderPassColorAttachmentDescriptor *att=desc.colorAttachments[i];
             id<MTLTexture> tex=att.texture;
             if (!tex || tex.width < 160 || tex.height < 90) continue;
+            if (Known(seenColorTags,&seenColorTagCount,(uintptr_t)(__bridge void *)tex ^ i ^ att.loadAction<<4 ^ att.storeAction<<8)) continue;
             id<MTLTexture> resolve=att.resolveTexture;
             NSString *key=[NSString stringWithFormat:
                 @"slot=%lu %lux%lu fmt=%lu type=%lu samples=%lu usage=%lu storage=%lu load=%lu store=%lu resolve=%lux%lu rfmt=%lu label=%@",
@@ -75,8 +93,10 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
         id<MTLTexture> tex = desc.depthAttachment.texture;
         if (tex && tex.width >= 320 && tex.height >= 180) {
             draws++;
+            if (!Known(seenDepthTags,&seenDepthTagCount,(uintptr_t)(__bridge void *)tex ^ desc.depthAttachment.loadAction<<4 ^ desc.depthAttachment.storeAction<<8)) {
             NSString *key = [NSString stringWithFormat:@"%p %lux%lu fmt=%lu type=%lu samples=%lu usage=%lu storage=%lu load=%lu store=%lu clear=%.9g label=%@", (__bridge void *)tex, tex.width, tex.height, tex.pixelFormat, tex.textureType, tex.sampleCount, tex.usage, tex.storageMode, desc.depthAttachment.loadAction, desc.depthAttachment.storeAction, desc.depthAttachment.clearDepth, tex.label];
             if (seenDepths.count < 120 && ![seenDepths containsObject:key]) { [seenDepths addObject:key]; Log([@"depth " stringByAppendingString:key]); }
+            }
             float aspect = (float)tex.width / tex.height;
             if (tex.sampleCount == 1 && aspect > 1.70 && aspect < 1.85 && tex.width >= 640 && tex.width*tex.height >= depthArea) {
                 currentDepth = tex;

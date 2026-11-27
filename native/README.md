@@ -14,6 +14,32 @@ Transparent surfaces and thin objects can show reflection errors. The shaders pr
 
 The current SSR path builds a conservative R32Float closest-depth hierarchy with up to seven mip levels every fresh-depth frame, then traverses that hierarchy instead of using the older fixed/exponential full-resolution depth march. The hierarchy is private GPU storage and is reused per in-flight frame slot.
 
+## Frame pipeline
+
+1. Compute kernels build the depth hierarchy. Mip 0 is at most 1920 texels wide, so a guest depth buffer at a higher resolution scale costs the same to trace. Every later depth read uses the hierarchy.
+2. With `halfResolution`, the surface pass runs twice. The first run shades occlusion, bounce light, and rough reflections at half the effect size. The second run shades mirror-like reflections, such as water, at the full effect size and skips all other pixels.
+3. The resolve pass joins the two results with a depth-aware filter. The filter removes sampling grain and keeps silhouettes sharp.
+4. Bloom runs only when `bloom` is above `0`.
+5. The composite pass reads the drawable in place through framebuffer fetch. The frame is never copied. Framebuffer fetch requires an Apple GPU.
+
+The surface passes skip the HUD regions. Each pixel rotates its occlusion samples, which removes the fixed pattern of the earlier version.
+
+## Power use
+
+GPU time of the shader passes on an M1 Pro, measured with `cinematic-test` on two captured frames at a 3566x2006 output:
+
+| Capture | Before | After |
+| --- | --- | --- |
+| 1600x900 guest depth | 3.45 ms | 1.58 ms |
+| 3200x1800 guest depth | 4.97 ms | 2.14 ms |
+
+- `halfResolution` (default `true`): set it to `false` to shade every effect at the full effect size. That costs about 3 ms and 4 ms on the two captures.
+- `effectWidth` scales the surface work. `960` uses about half the work of `1280`.
+- `adaptivePower` (default `true`) reduces the effect width by a quarter in Low Power Mode and under thermal pressure.
+- Set `reflections`, `occlusion`, or `bloom` to `0` to skip that work.
+
+The Metal bridge formats a diagnostic string only for a render target that the log has not recorded. The preset file is parsed only after it changes.
+
 The installed preset uses the current HDR output. Keep HDR enabled in Astris.
 The reflection/contact pass uses a 1280-pixel effect texture by default. The final image retains the original output resolution.
 
@@ -28,7 +54,7 @@ The active preset is here:
 
 `~/Library/Containers/V380-Ori.Astris/Data/Documents/SMOShaders/preset.json`
 
-The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, `effectWidth`, `debugView`, and `debugMip`.
+The preset supports `reflections`, `occlusion`, `bloom`, `exposure`, `saturation`, `contrast`, `verticalFov`, `effectWidth`, `halfResolution`, `adaptivePower`, `debugView`, and `debugMip`. Each debug view shades at the full effect size.
 
 Hi-Z debug modes:
 
@@ -54,7 +80,15 @@ python3 install_shaders.py --restore
 The installer records the original application backup in `installation.json` beside the active preset.
 The restore command checks the installed file hashes before it changes Astris.
 
-The Hi-Z implementation has passed the repository's compile-only Metal pipeline check on Apple Silicon. Visual quality, traversal cost, and live 60 FPS behavior still require in-game validation because the compile-only path cannot reproduce every Astris/MoltenVK render-pass interaction.
+`build_shaders.sh` also builds `cinematic-test`. It compiles the shaders, renders a captured frame, and measures GPU time:
+
+```sh
+./cinematic-test . <capture directory> <output.rgba16f> <benchmark frames>
+```
+
+`Cinematic.metal` and `libSMOCinematic.dylib` must come from the same version. The loader rejects a shader file with another settings layout.
+
+The pipeline passed Metal API Validation and shader validation with two captured Odyssey frames on Apple Silicon. Visual quality, traversal cost, and live 60 FPS behavior still require in-game validation because the compile-only path cannot reproduce every Astris/MoltenVK render-pass interaction.
 
 The direct Metal integration follows the presentation sequence in [MoltenVK](https://github.com/KhronosGroup/MoltenVK/blob/main/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm).
 The shaders and native integration in this package are custom source code.

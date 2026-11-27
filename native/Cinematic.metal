@@ -1,3 +1,4 @@
+// settings-layout: 3
 #include <metal_stdlib>
 using namespace metal;
 
@@ -18,6 +19,8 @@ struct Settings {
     float2 direction;
     float debugMip;
     float hierarchyLevels;
+    float surfaceMode;   // SurfaceAll, SurfaceLow, or SurfaceDetail
+    float reserved;
 };
 struct GeometryInfo {
     float3 normal;
@@ -27,10 +30,6 @@ struct GeometryInfo {
 struct MaterialInfo {
     float weight;
     float roughness;
-};
-struct SurfaceOutput {
-    float4 effects [[color(0)]];     // Bounce RGB, AO alpha.
-    float4 reflection [[color(1)]];  // Radiance times weight RGB, composite weight alpha.
 };
 
 // Capture evidence: Depth32Float clears to 1. Larger values are farther away.
@@ -42,6 +41,23 @@ kernel void depthHierarchyCopy(depth2d<float,access::read> depth [[texture(0)]],
     if (any(tid>=uint2(target.get_width(),target.get_height()))) return;
     float d=depth.read(tid);
     target.write(float4(isfinite(d)&&d>.001&&d<.99998 ? d : 1.0),tid);
+}
+// Mip 0 is smaller than a guest depth buffer wider than 1920 texels. Cover
+// every overlapping source texel, as the reduction below does.
+kernel void depthHierarchyShrink(depth2d<float,access::read> depth [[texture(0)]],
+    texture2d<float,access::write> target [[texture(1)]], uint2 tid [[thread_position_in_grid]]) {
+    uint2 dstSize=uint2(target.get_width(),target.get_height());
+    if (any(tid>=dstSize)) return;
+    uint2 srcSize=uint2(depth.get_width(),depth.get_height());
+    uint2 first=tid*srcSize/dstSize;
+    uint2 end=((tid+1)*srcSize+dstSize-1)/dstSize;
+    float closest=1.0;
+    for (uint y=first.y;y<end.y;++y)
+        for (uint x=first.x;x<end.x;++x) {
+            float d=depth.read(uint2(x,y));
+            if (isfinite(d)&&d>.001&&d<.99998) closest=min(closest,d);
+        }
+    target.write(float4(closest),tid);
 }
 kernel void depthHierarchyReduce(texture2d<float,access::read> source [[texture(0)]],
     texture2d<float,access::write> target [[texture(1)]], uint2 tid [[thread_position_in_grid]]) {
@@ -60,7 +76,14 @@ kernel void depthHierarchyReduce(texture2d<float,access::read> source [[texture(
 }
 
 constexpr sampler linearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
-constexpr sampler depthSampler(coord::normalized, address::clamp_to_edge, filter::nearest);
+
+// Every depth read uses the hierarchy. Mip 0 is the sanitized guest depth, at
+// most 1920 texels wide; the surface passes never touch the guest texture.
+typedef texture2d<float> DepthTexture;
+constexpr sampler depthSampler(coord::normalized,address::clamp_to_edge,filter::nearest,mip_filter::none);
+float depthAt(DepthTexture depth,float2 uv) {
+    return depth.sample(depthSampler,uv,level(0)).r;
+}
 
 vertex VertexOut fullScreen(uint id [[vertex_id]]) {
     float2 p=float2((id<<1)&2,id&2);
@@ -68,10 +91,10 @@ vertex VertexOut fullScreen(uint id [[vertex_id]]) {
 }
 
 float luminance(float3 x) { return dot(x,float3(.2126,.7152,.0722)); }
-float zValue(depth2d<float> depth,float2 uv) {
-    return 1.0/max(1.0-depth.sample(depthSampler,uv),.00002);
+float zValue(DepthTexture depth,float2 uv) {
+    return 1.0/max(1.0-depthAt(depth,uv),.00002);
 }
-float3 positionAt(depth2d<float> depth,float2 uv,constant Settings &s) {
+float3 positionAt(DepthTexture depth,float2 uv,constant Settings &s) {
     return float3((uv.x*2-1)*s.aspect*s.tanHalfFov,(1-uv.y*2)*s.tanHalfFov,1)*zValue(depth,uv);
 }
 float2 project(float3 p,constant Settings &s) {
@@ -89,7 +112,7 @@ float farDepthTrust(float rawDepth) {
     // their full reflection energy.
     return 1-smoothstep(.9960,.99935,rawDepth);
 }
-GeometryInfo geometryAt(depth2d<float> depth,float2 uv,float3 p,constant Settings &s) {
+GeometryInfo geometryAt(DepthTexture depth,float2 uv,float3 p,constant Settings &s) {
     float2 dx=float2(s.depthTexel.x*2,0),dy=float2(0,s.depthTexel.y*2);
     float3 left=positionAt(depth,clamp(uv-dx,.001,.999),s);
     float3 right=positionAt(depth,clamp(uv+dx,.001,.999),s);
@@ -142,13 +165,13 @@ float sceneMask(float2 uv) {
     float bottom=smoothstep(.90,.98,uv.y);
     return 1-max(max(topLeft,topRight),bottom);
 }
-float depthSimilarity(depth2d<float> depth,float2 uv,float centerZ,float tolerance) {
-    float raw=depth.sample(depthSampler,clamp(uv,.001,.999));
+float depthSimilarity(DepthTexture depth,float2 uv,float centerZ,float tolerance) {
+    float raw=depthAt(depth,clamp(uv,.001,.999));
     if (raw>.99998||raw<.001) return 0;
     float sampleZ=1.0/max(1.0-raw,.00002);
     return 1-smoothstep(tolerance,tolerance*5,abs(sampleZ-centerZ));
 }
-float3 filteredReflection(texture2d<float> color,depth2d<float> depth,
+float3 filteredReflection(texture2d<float> color,DepthTexture depth,
                           float2 hitUV,float hitZ,float roughness,float travelRatio,
                           constant Settings &s) {
     float radius=mix(1.0,7.0,roughness*roughness)*(1+min(travelRatio,3.0)*.18);
@@ -271,8 +294,7 @@ float cellExit(ProjectedRay r,uint2 cell,uint2 size,float t) {
 // Geometry and material acquisition stay outside this function. True G-buffer
 // inputs and stochastic directions can replace their estimates later. The
 // result contains current-frame radiance only. It has no temporal history.
-ReflectionResult traceReflection(texture2d<float> color,depth2d<float> depth,
-    texture2d<float,access::read> hierarchy,float2 uv,float3 p,GeometryInfo geometry,
+ReflectionResult traceReflection(texture2d<float> color,DepthTexture hierarchy,float2 uv,float3 p,GeometryInfo geometry,
     MaterialInfo material,float3 base,float reflectivity,constant Settings &s) {
     ReflectionResult result={float3(0),0,0,0,0,TraceMiss};
     float raw=1-1/p.z;
@@ -353,14 +375,14 @@ ReflectionResult traceReflection(texture2d<float> color,depth2d<float> depth,
             // Keep source reach constant in screen space when guest depth
             // changes from 1600 to 3200 pixels. This is not a distance cut.
             float referencePixels=length((hitUV-uv)*float2(1600,1600/s.aspect));
-            GeometryInfo hitGeometry=geometryAt(depth,hitUV,hitP,s);
+            GeometryInfo hitGeometry=geometryAt(hierarchy,hitUV,hitP,s);
             float frontFace=smoothstep(.02,.28,dot(hitGeometry.normal,-direction));
             float sourceTrust=sourceDistanceConfidence(hitGeometry,travelRatio,referencePixels,material.roughness);
             float candidate=valid*frontFace*edge*separation*sceneMask(hitUV)*distanceFade*
                 geometry.continuity*hitGeometry.continuity*sourceTrust*hitFarTrust*hitHdrTrust;
             if (candidate>.020) {
                 result.confidence=candidate;
-                result.radiance=fireflyClamp(filteredReflection(color,depth,hitUV,hitZ,material.roughness,travelRatio,s),base);
+                result.radiance=fireflyClamp(filteredReflection(color,hierarchy,hitUV,hitZ,material.roughness,travelRatio,s),base);
                 result.reason=TraceHit;
                 return result;
             }
@@ -368,9 +390,11 @@ ReflectionResult traceReflection(texture2d<float> color,depth2d<float> depth,
             if (result.candidates>=candidateBudget) return result;
         }
         // A leaf that lies entirely behind its finite thickness is not a hit.
-        // Move past this leaf before ascent, including after source rejection.
+        // Move past this leaf, including after source rejection. A ray behind
+        // an occluder stays on mip 0: the coarser cell would only send it
+        // straight back down, and that round trip doubles the lookups.
         t=exit+ray.epsilon;
-        mip=min(1,maxMip);
+        mip=gap>=thickness*1.8 ? 0 : min(1,maxMip);
     }
     if (result.reason==TraceMiss) result.reason=t>=ray.end ? ray.endReason : TraceBudget;
     return result;
@@ -390,35 +414,56 @@ float3 traceReasonColor(uint reason) {
     }
 }
 
-fragment SurfaceOutput surfaceEffects(VertexOut in [[stage_in]],
-    texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],
-    texture2d<float,access::read> hierarchy [[texture(2)]],constant Settings &s [[buffer(0)]]) {
+// At half resolution the surface pass runs twice. SurfaceLow shades
+// occlusion, bounce, and rough reflections on a half-size target. SurfaceDetail
+// shades mirror-like reflections at the full effect size and writes them as a
+// delta (weighted radiance, minus weight), so the resolve pass adds the two.
+// The reflection weight crosses over between the two roughness limits.
+enum SurfaceMode : uint { SurfaceAll=0, SurfaceLow=1, SurfaceDetail=2 };
+constant float2 detailRoughness=float2(.20,.30);
+
+// One target holds every depth-driven effect. The composite computes
+// raw*alpha+rgb, so rgb is bounce plus weighted reflection radiance and alpha
+// is occlusion minus reflection weight. Both terms stay linear under filtering.
+fragment float4 surfaceEffects(VertexOut in [[stage_in]],
+    texture2d<float> color [[texture(0)]],DepthTexture hierarchy [[texture(1)]],
+    constant Settings &s [[buffer(0)]]) {
     float2 uv=in.uv;
-    SurfaceOutput output={float4(0,0,0,1),float4(0)};
     uint debug=uint(s.debugView+.5);
+    uint mode=debug==0 ? uint(s.surfaceMode+.5) : uint(SurfaceAll);
+    float4 output=float4(0,0,0,mode==SurfaceDetail ? 0 : 1);
     // Check freshness before any depth or hierarchy access.
     if (s.depthAvailable<.5 || s.hierarchyLevels<1) {
-        if (debug==8) output.effects=float4(traceReasonColor(TraceUnavailable),1);
+        if (debug==8) output=float4(traceReasonColor(TraceUnavailable),1);
         return output;
     }
-    float rawDepth=depth.sample(depthSampler,uv);
-    if (debug==4) { output.effects=float4(float3(rawDepth),1); return output; }
+    float mask=sceneMask(uv);
+    if (debug==0 && mask<.002) return output;
+    float centerDepth=depthAt(hierarchy,uv);
+    if (debug==4) { output=float4(float3(centerDepth),1); return output; }
     if (debug==5) {
         uint mip=min(uint(s.debugMip),uint(s.hierarchyLevels)-1);
         uint2 size=uint2(hierarchy.get_width(mip),hierarchy.get_height(mip));
         float d=hierarchy.read(min(uint2(uv*float2(size)),size-1),mip).r;
-        output.effects=float4(float3(d>=1 ? 1 : log2(1/max(1-d,.00002))/12),1);
+        output=float4(float3(d>=1 ? 1 : log2(1/max(1-d,.00002))/12),1);
         return output;
     }
-    if (!isfinite(rawDepth)||rawDepth>.99998||rawDepth<.001) {
-        if (debug==8) output.effects=float4(traceReasonColor(TraceDepth),1);
+    if (!isfinite(centerDepth)||centerDepth>.99998||centerDepth<.001) {
+        if (debug==8) output=float4(traceReasonColor(TraceDepth),1);
         return output;
     }
     float3 base=max(color.sample(linearSampler,uv).rgb,0.0);
-    float3 p=positionWithZ(uv,1/max(1-rawDepth,.00002),s);
-    GeometryInfo geometry=geometryAt(depth,uv,p,s);
+    float3 p=positionWithZ(uv,1/max(1-centerDepth,.00002),s);
+    // The detail pass shades only mirror-like surfaces. Curvature only adds
+    // roughness, so a flat-surface estimate rejects whole rough regions here,
+    // before any further depth read.
+    if (mode==SurfaceDetail) {
+        GeometryInfo flat={float3(0,0,-1),1,0};
+        if (classifyMaterial(base,flat).roughness>=detailRoughness.y) return output;
+    }
+    GeometryInfo geometry=geometryAt(hierarchy,uv,p,s);
     float3 n=geometry.normal;
-    float farTrust=farDepthTrust(rawDepth);
+    float farTrust=farDepthTrust(centerDepth);
     float hdrTrust=hdrSurfaceTrust(base);
     float surfaceTrust=farTrust*hdrTrust;
     float traceZ=min(p.z,512.0);
@@ -426,17 +471,22 @@ fragment SurfaceOutput surfaceEffects(VertexOut in [[stage_in]],
     float ao=0;
     float3 bounce=0;
     float radius=traceZ*.10;
-    for (uint i=0;i<12;++i) {
-        float angle=float(i)*2.39996323;
+    // Each pixel rotates the sample spiral. A fixed spiral stamps offset
+    // copies of nearby silhouettes onto the ground; the rotation turns them
+    // into grain, which the resolve pass removes.
+    float rotation=6.2831853*fract(52.9829189*fract(dot(floor(in.position.xy),float2(.06711056,.00583715))));
+    for (uint i=0;i<12 && s.occlusion>.001 && mode!=SurfaceDetail;++i) {
+        float angle=float(i)*2.39996323+rotation;
         float scale=sqrt((float(i)+.5)/12.0);
         float2 delta=float2(cos(angle)/s.aspect,sin(angle))*(.032*scale);
         float2 sampleUV=clamp(uv+delta,.001,.999);
-        float3 q=positionAt(depth,sampleUV,s);
+        float3 q=positionAt(hierarchy,sampleUV,s);
         float3 v=q-p;
         float distance=length(v);
-        float weight=max(dot(n,v/max(distance,.0001))-.075,0.0)*(1-smoothstep(radius*.25,radius,distance));
+        // The outer rings fade, so the kernel boundary leaves no outline.
+        float weight=max(dot(n,v/max(distance,.0001))-.075,0.0)*(1-smoothstep(radius*.25,radius,distance))*(1.5-1.2*scale*scale);
         ao+=weight;
-        bounce+=clampIndirectSample(color.sample(linearSampler,sampleUV).rgb)*weight;
+        if (weight>0) bounce+=clampIndirectSample(color.sample(linearSampler,sampleUV).rgb)*weight;
     }
     ao=clamp(1-ao*(s.occlusion/4.0),.58,1.0);
     ao=mix(1.0,ao,surfaceTrust);
@@ -450,26 +500,54 @@ fragment SurfaceOutput surfaceEffects(VertexOut in [[stage_in]],
     float fresnel=.20+.80*pow(1-clamp(dot(n,-view),0.0,1.0),4.0);
     float roughEnergy=mix(1.0,.72,materialInfo.roughness);
     float reflectivity=s.reflections*materialInfo.weight*fresnel*roughEnergy*surfaceTrust;
+    float detail=1-smoothstep(detailRoughness.x,detailRoughness.y,materialInfo.roughness);
+    if (mode==SurfaceLow) reflectivity*=1-detail;
+    if (mode==SurfaceDetail) reflectivity*=detail;
 
-    ReflectionResult hit=traceReflection(color,depth,hierarchy,uv,p,geometry,materialInfo,base,reflectivity,s);
-    float mask=sceneMask(uv);
+    ReflectionResult hit=traceReflection(color,hierarchy,uv,p,geometry,materialInfo,base,reflectivity,s);
     float darkening=smoothstep(0.0,.25,luminance(base)-luminance(hit.radiance));
     float strength=min(reflectivity*hit.confidence,.72)*(1-.72*darkening);
-    output.effects=float4(bounce*mask,mix(1.0,ao,mask));
-    // Premultiply before the full-resolution pass filters this texture.
+    // Premultiply the reflection before any pass filters this texture.
     // Separate RGB/alpha interpolation would attenuate hit boundaries twice.
-    output.reflection=float4(hit.radiance*strength*mask,strength*mask);
+    output=float4((bounce+hit.radiance*strength)*mask,mix(1.0,ao,mask)-strength*mask);
+    if (mode==SurfaceDetail) output.a-=1;
 
-    if (debug==1) output.effects=float4(float3(log2(p.z)/12),1);
-    if (debug==2) output.effects=float4(n*.5+.5,1);
-    if (debug==3) output.effects=float4(float3(hit.confidence),1);
+    if (debug==1) output=float4(float3(log2(p.z)/12),1);
+    if (debug==2) output=float4(n*.5+.5,1);
+    if (debug==3) output=float4(float3(hit.confidence),1);
     // Fixed scales permit comparisons across roughness and scenes. Red is all
     // hierarchy reads / 64, green is mip-0 reads / 64, blue is candidates / 8.
-    if (debug==6) output.effects=float4(float3(hit.lookups/64.0,hit.fineLookups/64.0,hit.candidates/8.0),1);
-    if (debug==7) output.effects=float4(hit.radiance,1);
-    if (debug==8) output.effects=float4(traceReasonColor(hit.reason),1);
-    if (debug==9) output.effects=float4(materialInfo.weight,materialInfo.roughness,surfaceTrust,1);
+    if (debug==6) output=float4(float3(hit.lookups/64.0,hit.fineLookups/64.0,hit.candidates/8.0),1);
+    if (debug==7) output=float4(hit.radiance,1);
+    if (debug==8) output=float4(traceReasonColor(hit.reason),1);
+    if (debug==9) output=float4(materialInfo.weight,materialInfo.roughness,surfaceTrust,1);
     return output;
+}
+
+// Depth-aware filter that writes the effect texture. It removes the occlusion
+// grain and the one-pixel reflection streaks without crossing silhouettes, and
+// at half resolution it upsamples the low pass and adds the detail pass.
+fragment float4 resolveEffects(VertexOut in [[stage_in]],texture2d<float> effects [[texture(0)]],
+    DepthTexture depth [[texture(1)]],texture2d<float> detail [[texture(2)]],constant Settings &s [[buffer(0)]]) {
+    float4 center=effects.sample(linearSampler,in.uv);
+    if (s.debugView>.5) return center;
+    bool halfSize=s.surfaceMode>.5;
+    float4 extra=halfSize ? detail.sample(linearSampler,in.uv) : float4(0);
+    float raw=depthAt(depth,in.uv);
+    if (raw>.99998) return center+extra;
+    float centerZ=1/max(1-raw,.00002);
+    // A half-size source has no texel at this pixel's depth by default, so
+    // its unweighted center tap counts for little.
+    float total=halfSize ? .25 : 2;
+    float4 sum=center*total;
+    float2 spread=s.direction*(halfSize ? 1.0 : 1.5);
+    for (uint i=0;i<4;++i) {
+        float2 uv=in.uv+float2(i&1 ? 1 : -1,i&2 ? 1 : -1)*spread;
+        float w=depthSimilarity(depth,uv,centerZ,centerZ*.008);
+        sum+=effects.sample(linearSampler,uv)*w;
+        total+=w;
+    }
+    return sum/total+extra;
 }
 
 fragment float4 bloomExtract(VertexOut in [[stage_in]],texture2d<float> color [[texture(0)]],constant Settings &s [[buffer(0)]]) {
@@ -493,24 +571,25 @@ fragment float4 bloomBlur(VertexOut in [[stage_in]],texture2d<float> color [[tex
     c+=(color.sample(linearSampler,in.uv+s.direction*5.1764706).rgb+color.sample(linearSampler,in.uv-s.direction*5.1764706).rgb)*.01038136;
     return float4(c,1);
 }
-fragment float4 composite(VertexOut in [[stage_in]],texture2d<float> original [[texture(0)]],
-    texture2d<float> effects [[texture(1)]],texture2d<float> bloomTex [[texture(2)]],
-    texture2d<float> reflectionTex [[texture(3)]],constant Settings &s [[buffer(0)]]) {
-    float3 raw=max(original.sample(linearSampler,in.uv).rgb,0.0);
-    float4 fx=effects.sample(linearSampler,in.uv);
+// Reads the drawable through framebuffer fetch, so the frame is never copied.
+fragment float4 composite(VertexOut in [[stage_in]],float4 destination [[color(0)]],
+    texture2d<float> effects [[texture(0)]],texture2d<float> bloomTex [[texture(1)]],
+    constant Settings &s [[buffer(0)]]) {
+    float3 raw=max(destination.rgb,0.0);
+    float mask=sceneMask(in.uv);
+    float4 fx=s.depthAvailable>.5 ? effects.sample(linearSampler,in.uv) : float4(0,0,0,1);
     if (s.debugView>.5) return float4(fx.rgb,1);
+    if (mask<.002) return float4(raw,1);
 
-    float4 reflection=reflectionTex.sample(linearSampler,in.uv);
-    float3 c=max(raw*fx.a+fx.rgb+reflection.rgb-raw*reflection.a,0.0);
+    float3 c=max(raw*fx.a+fx.rgb,0.0);
     float rawL=luminance(raw);
     float highlightProtect=1-smoothstep(.65,1.55,rawL);
     // Once the game's own HDR output is already bright, adding our blurred
     // bloom back on top only destroys waterfall/cloud detail. Fade it fully
     // rather than retaining the old 25% floor.
     float bloomProtect=1-smoothstep(.80,1.55,rawL);
-    c+=bloomTex.sample(linearSampler,in.uv).rgb*s.bloom*bloomProtect;
+    if (s.bloom>0) c+=bloomTex.sample(linearSampler,in.uv).rgb*s.bloom*bloomProtect;
 
-    float mask=sceneMask(in.uv);
     float exposure=mix(1.0,s.exposure,highlightProtect);
     c*=exposure;
     float l=luminance(c);
