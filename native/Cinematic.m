@@ -5,20 +5,26 @@
 #include <dlfcn.h>
 #include <math.h>
 #include <stddef.h>
+#include <sys/stat.h>
 
 typedef struct {
     simd_float2 texel, depthTexel;
     float aspect, tanHalfFov, reflections, occlusion, bloom, exposure;
     float saturation, contrast, debugView, depthAvailable;
     simd_float2 direction;
-    float debugMip, hierarchyLevels;
+    float debugMip, hierarchyLevels, surfaceMode, normalsAvailable;
 } ShaderSettings;
-_Static_assert(sizeof(ShaderSettings)==72 && offsetof(ShaderSettings,debugMip)==64,
+// Cinematic.metal carries the same layout number.
+#define SETTINGS_LAYOUT @"// settings-layout: 4"
+_Static_assert(sizeof(ShaderSettings)==80 && offsetof(ShaderSettings,debugMip)==64,
                "ShaderSettings must match the Metal constant buffer.");
 typedef void (*FrameProcessor)(id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTexture>);
 
 @interface ShaderFrame : NSObject
-@property id<MTLTexture> color, effects, reflections, bloomA, bloomB, depthHierarchy;
+@property id<MTLTexture> low, surface, effects, bloomA, bloomB, depthHierarchy, normals;
+// The world-to-view rotation fitted for the normals of this slot.
+@property id<MTLBuffer> normalFit;
+@property BOOL hasNormals, hasMaterials;
 @property NSArray<id<MTLTexture>> *hierarchyMips;
 @property BOOL busy;
 @end
@@ -28,12 +34,12 @@ typedef void (*FrameProcessor)(id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTextu
 @interface ShaderProgram : NSObject
 @property id<MTLDevice> device;
 @property id<MTLLibrary> library;
-@property id<MTLRenderPipelineState> surface, extract, blur, composite;
-@property id<MTLComputePipelineState> hierarchyCopy, hierarchyReduce;
+@property id<MTLRenderPipelineState> surface, resolve, extract, blur, composite;
+@property id<MTLComputePipelineState> hierarchyCopy, hierarchyShrink, hierarchyReduce, normalRows, normalFit, normalView;
 @property NSMutableArray<ShaderFrame *> *frames;
 @property ShaderSettings settings;
-@property NSUInteger effectWidth;
-@property BOOL enabled;
+@property NSUInteger effectWidth, depthDelay;
+@property BOOL enabled, adaptivePower, halfResolution, gameNormals, gameMaterials;
 @property BOOL failed;
 @end
 @implementation ShaderProgram
@@ -45,10 +51,19 @@ static NSString *directory;
 static dispatch_source_t timer;
 static id<MTLTexture> lastDepth;
 static uint64_t frameCount, errorCount, skippedFrames, missingDepthFrames;
+// The slot whose hierarchy the previous present built, for depthDelay.
+static ShaderFrame *heldFrame;
+static BOOL captureRequested;
+// Returns the G-buffer normal target of the frame being presented, or nil.
+static id<MTLTexture> (*frameNormals)(void);
+static id<MTLTexture> (*frameGBuffer)(NSUInteger);
 static double presentCBMilliseconds;
 static NSString *lastError = @"none";
 static FILE *logFile;
-static BOOL gameAllowed=YES;
+static BOOL gameAllowed=YES, reducedPower;
+static struct timespec settingsTime;
+static off_t settingsSize=-1;
+static ino_t settingsFile;
 
 static void Log(NSString *text) {
     if (logFile) { fprintf(logFile,"%s\n",text.UTF8String); fflush(logFile); }
@@ -66,10 +81,15 @@ static void UpdateSettings(ShaderProgram *p, NSDictionary *d) {
     s.saturation=Number(d,@"saturation",1.12,0,2);
     s.contrast=Number(d,@"contrast",1.055,.5,1.5);
     s.tanHalfFov=tanf(Number(d,@"verticalFov",50,30,100)*M_PI/360);
-    s.debugView=Number(d,@"debugView",0,0,9);
+    s.debugView=Number(d,@"debugView",0,0,10);
     s.debugMip=Number(d,@"debugMip",0,0,6);
     p.settings=s;
     p.effectWidth=(NSUInteger)Number(d,@"effectWidth",960,480,1920);
+    p.depthDelay=(NSUInteger)Number(d,@"depthDelay",1,0,1);
+    p.halfResolution=d[@"halfResolution"] ? [d[@"halfResolution"] boolValue] : YES;
+    p.gameNormals=d[@"gameNormals"] ? [d[@"gameNormals"] boolValue] : YES;
+    p.gameMaterials=d[@"gameMaterials"] ? [d[@"gameMaterials"] boolValue] : YES;
+    p.adaptivePower=d[@"adaptivePower"] ? [d[@"adaptivePower"] boolValue] : YES;
     p.enabled=d[@"enabled"] ? [d[@"enabled"] boolValue] : YES;
 }
 static NSDictionary *ReadSettings(void) {
@@ -77,13 +97,26 @@ static NSDictionary *ReadSettings(void) {
     id value=data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
     return [value isKindOfClass:NSDictionary.class] ? value : @{};
 }
+// The preset is polled once per second. Parse it only after it changes.
+static BOOL SettingsChanged(void) {
+    struct stat info;
+    if (stat([[directory stringByAppendingPathComponent:@"preset.json"] fileSystemRepresentation],&info)) {
+        // A removed preset restores the defaults once.
+        BOOL existed=settingsSize!=-1;
+        settingsSize=-1;
+        return existed;
+    }
+    if (info.st_size==settingsSize && info.st_ino==settingsFile && info.st_mtimespec.tv_sec==settingsTime.tv_sec &&
+        info.st_mtimespec.tv_nsec==settingsTime.tv_nsec) return NO;
+    settingsSize=info.st_size; settingsFile=info.st_ino; settingsTime=info.st_mtimespec;
+    return YES;
+}
 static id<MTLRenderPipelineState> Pipeline(ShaderProgram *p, NSString *fragment, NSError **error) {
     MTLRenderPipelineDescriptor *desc=[MTLRenderPipelineDescriptor new];
     desc.label=[@"SMO Cinematic / " stringByAppendingString:fragment];
     desc.vertexFunction=[p.library newFunctionWithName:@"fullScreen"];
     desc.fragmentFunction=[p.library newFunctionWithName:fragment];
     desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA16Float;
-    if ([fragment isEqualToString:@"surfaceEffects"]) desc.colorAttachments[1].pixelFormat=MTLPixelFormatRGBA16Float;
     return [p.device newRenderPipelineStateWithDescriptor:desc error:error];
 }
 static id<MTLComputePipelineState> ComputePipeline(ShaderProgram *p, NSString *kernel, NSError **error) {
@@ -103,19 +136,31 @@ static BOOL LoadProgram(void) {
     NSString *source=[NSString stringWithContentsOfFile:[directory stringByAppendingPathComponent:@"Cinematic.metal"] encoding:NSUTF8StringEncoding error:&error];
     ShaderProgram *p=[ShaderProgram new];
     p.device=MTLCreateSystemDefaultDevice();
+    if (source && ![source containsString:SETTINGS_LAYOUT]) {
+        [lock lock];
+        lastError=@"Cinematic.metal does not match this libSMOCinematic.dylib. Install both files from the same version.";
+        Log(lastError);
+        [lock unlock];
+        return NO;
+    }
     if (source) {
         MTLCompileOptions *options=[MTLCompileOptions new];
         p.library=[p.device newLibraryWithSource:source options:options error:&error];
     }
     if (p.library) {
         p.surface=Pipeline(p,@"surfaceEffects",&error);
-        if (p.surface) p.extract=Pipeline(p,@"bloomExtract",&error);
+        if (p.surface) p.resolve=Pipeline(p,@"resolveEffects",&error);
+        if (p.resolve) p.extract=Pipeline(p,@"bloomExtract",&error);
         if (p.extract) p.blur=Pipeline(p,@"bloomBlur",&error);
         if (p.blur) p.composite=Pipeline(p,@"composite",&error);
         if (p.composite) p.hierarchyCopy=ComputePipeline(p,@"depthHierarchyCopy",&error);
-        if (p.hierarchyCopy) p.hierarchyReduce=ComputePipeline(p,@"depthHierarchyReduce",&error);
+        if (p.hierarchyCopy) p.hierarchyShrink=ComputePipeline(p,@"depthHierarchyShrink",&error);
+        if (p.hierarchyShrink) p.hierarchyReduce=ComputePipeline(p,@"depthHierarchyReduce",&error);
+        if (p.hierarchyReduce) p.normalRows=ComputePipeline(p,@"normalRows",&error);
+        if (p.normalRows) p.normalFit=ComputePipeline(p,@"normalFit",&error);
+        if (p.normalFit) p.normalView=ComputePipeline(p,@"normalView",&error);
     }
-    if (!p.surface || !p.extract || !p.blur || !p.composite || !p.hierarchyCopy || !p.hierarchyReduce) {
+    if (!p.surface || !p.resolve || !p.extract || !p.blur || !p.composite || !p.hierarchyCopy || !p.hierarchyShrink || !p.hierarchyReduce || !p.normalRows || !p.normalFit || !p.normalView) {
         [lock lock];
         lastError=error.description ?: @"Shader pipeline creation failed";
         Log(lastError);
@@ -125,7 +170,7 @@ static BOOL LoadProgram(void) {
     p.frames=[NSMutableArray new];
     UpdateSettings(p,ReadSettings());
     [lock lock]; program=p; [lock unlock];
-    Log(@"Metal shader compilation passed. Four render pipelines and two compute pipelines are ready.");
+    Log(@"Metal shader compilation passed. Five render pipelines and five compute pipelines are ready.");
     return YES;
 }
 static id<MTLTexture> Texture(id<MTLDevice> device, NSUInteger w, NSUInteger h, NSString *name) {
@@ -170,8 +215,9 @@ static BOOL BuildHierarchy(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFram
     for (NSUInteger level=0; level<frame.hierarchyMips.count; level++) {
         id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
         if (!enc) return NO;
-        id<MTLComputePipelineState> pipeline=level==0 ? p.hierarchyCopy : p.hierarchyReduce;
         id<MTLTexture> output=frame.hierarchyMips[level];
+        id<MTLComputePipelineState> pipeline=level>0 ? p.hierarchyReduce :
+            (output.width==depth.width && output.height==depth.height ? p.hierarchyCopy : p.hierarchyShrink);
         enc.label=output.label;
         [enc setComputePipelineState:pipeline];
         [enc setTexture:level==0 ? depth : frame.hierarchyMips[level-1] atIndex:0];
@@ -180,6 +226,45 @@ static BOOL BuildHierarchy(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFram
         // Serial encoders and tracked views order each reduction after its source mip.
         [enc endEncoding];
     }
+    return YES;
+}
+// The game's G-buffer normals: an RG16Snorm target the size of the depth buffer.
+static BOOL UsableTarget(id<MTLTexture> normals, id<MTLTexture> depth, id<MTLDevice> device) {
+    return normals && normals.width==depth.width && normals.height==depth.height &&
+        normals.textureType==MTLTextureType2D && normals.sampleCount==1 && normals.device.registryID==device.registryID &&
+        normals.storageMode!=MTLStorageModeMemoryless &&
+        (normals.usage==MTLTextureUsageUnknown || (normals.usage&MTLTextureUsageShaderRead));
+}
+static BOOL UsableNormals(id<MTLTexture> normals, id<MTLTexture> depth, id<MTLDevice> device) {
+    return normals.pixelFormat==MTLPixelFormatRG16Snorm && UsableTarget(normals,depth,device);
+}
+// Must match NormalFit and fitGrid.y in Cinematic.metal.
+enum { NormalFitBytes=64, NormalFitRows=22 };
+// Fits the camera rotation for this present's normals and stores them in
+// view space. The previous slot supplies the prior for the fit.
+static BOOL BuildNormals(id<MTLCommandBuffer> cb, ShaderProgram *p, ShaderFrame *frame, ShaderFrame *previous,
+                         id<MTLTexture> normals, id<MTLTexture> material, id<MTLTexture> depth, const ShaderSettings *settings) {
+    id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
+    if (!enc) return NO;
+    enc.label=@"SMO normal fit";
+    [enc setComputePipelineState:p.normalRows];
+    [enc setTexture:normals atIndex:0];
+    [enc setTexture:frame.hierarchyMips[0] atIndex:1];
+    [enc setBuffer:frame.normalFit offset:0 atIndex:0];
+    [enc setBuffer:previous.normalFit ?: frame.normalFit offset:0 atIndex:1];
+    [enc setBytes:settings length:sizeof(*settings) atIndex:2];
+    [enc setBuffer:frame.normalFit offset:NormalFitBytes atIndex:3];
+    [enc dispatchThreads:MTLSizeMake(1,NormalFitRows,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+    [enc setComputePipelineState:p.normalFit];
+    [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+    [enc setComputePipelineState:p.normalView];
+    [enc setTexture:frame.normals atIndex:1];
+    [enc setTexture:depth atIndex:2];
+    [enc setTexture:material ?: normals atIndex:3];
+    uint32_t hasMaterial=material!=nil;
+    [enc setBytes:&hasMaterial length:sizeof(hasMaterial) atIndex:1];
+    [enc dispatchThreads:MTLSizeMake(frame.normals.width,frame.normals.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    [enc endEncoding];
     return YES;
 }
 static BOOL UsableDepth(id<MTLTexture> depth, id<MTLDevice> device) {
@@ -199,26 +284,99 @@ static BOOL UsableDepth(id<MTLTexture> depth, id<MTLDevice> device) {
 static void EncodingFailed(ShaderProgram *p, NSString *message) {
     [lock lock]; p.failed=YES; errorCount++; lastError=message; Log(message); [lock unlock];
 }
-static BOOL Draw(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLTexture> reflectionTarget, id<MTLRenderPipelineState> pipeline,
-                 NSArray<id<MTLTexture>> *textures, ShaderSettings settings) {
+static BOOL Draw(id<MTLCommandBuffer> cb, id<MTLTexture> target, MTLLoadAction load, id<MTLRenderPipelineState> pipeline,
+                 id<MTLTexture> first, id<MTLTexture> second, id<MTLTexture> third, const ShaderSettings *settings) {
     MTLRenderPassDescriptor *desc=[MTLRenderPassDescriptor renderPassDescriptor];
     desc.colorAttachments[0].texture=target;
-    desc.colorAttachments[0].loadAction=MTLLoadActionDontCare;
+    desc.colorAttachments[0].loadAction=load;
     desc.colorAttachments[0].storeAction=MTLStoreActionStore;
-    if (reflectionTarget) {
-        desc.colorAttachments[1].texture=reflectionTarget;
-        desc.colorAttachments[1].loadAction=MTLLoadActionDontCare;
-        desc.colorAttachments[1].storeAction=MTLStoreActionStore;
-    }
     id<MTLRenderCommandEncoder> enc=[cb renderCommandEncoderWithDescriptor:desc];
     if (!enc) return NO;
     enc.label=pipeline.label;
     [enc setRenderPipelineState:pipeline];
-    for (NSUInteger i=0;i<textures.count;i++) [enc setFragmentTexture:textures[i] atIndex:i];
-    [enc setFragmentBytes:&settings length:sizeof(settings) atIndex:0];
+    if (first) [enc setFragmentTexture:first atIndex:0];
+    if (second) [enc setFragmentTexture:second atIndex:1];
+    if (third) [enc setFragmentTexture:third atIndex:2];
+    [enc setFragmentBytes:settings length:sizeof(*settings) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [enc endEncoding];
     return YES;
+}
+// Writes the unprocessed color, this present's depth, and the previous
+// present's depth, and the game's normal target to align-capture/. The files show which depth matches the
+// presented color. Create the file capture-request beside the preset to arm it.
+static void EncodeCapture(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth, id<MTLTexture> previous, id<MTLTexture> normals) {
+    NSUInteger cs=(color.width*8+255)&~(NSUInteger)255, ds=(depth.width*4+255)&~(NSUInteger)255;
+    id<MTLBuffer> a=[color.device newBufferWithLength:cs*color.height options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b=[color.device newBufferWithLength:ds*depth.height options:MTLResourceStorageModeShared];
+    id<MTLBuffer> c=previous ? [color.device newBufferWithLength:ds*depth.height options:MTLResourceStorageModeShared] : nil;
+    NSUInteger ns=(normals.width*4+255)&~(NSUInteger)255;
+    id<MTLBuffer> n=normals ? [color.device newBufferWithLength:ns*normals.height options:MTLResourceStorageModeShared] : nil;
+    if (!a || !b) return;
+    id<MTLBlitCommandEncoder> blit=[cb blitCommandEncoder];
+    if (!blit) return;
+    MTLOrigin origin=MTLOriginMake(0,0,0);
+    MTLSize size=MTLSizeMake(depth.width,depth.height,1);
+    [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:MTLSizeMake(color.width,color.height,1) toBuffer:a destinationOffset:0 destinationBytesPerRow:cs destinationBytesPerImage:cs*color.height];
+    [blit copyFromTexture:depth sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:size toBuffer:b destinationOffset:0 destinationBytesPerRow:ds destinationBytesPerImage:ds*depth.height];
+    if (c) [blit copyFromTexture:previous sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:size toBuffer:c destinationOffset:0 destinationBytesPerRow:ds destinationBytesPerImage:ds*depth.height];
+    if (n) [blit copyFromTexture:normals sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:MTLSizeMake(normals.width,normals.height,1) toBuffer:n destinationOffset:0 destinationBytesPerRow:ns destinationBytesPerImage:ns*normals.height];
+    // Every readable color target of the G-buffer pass, to identify them.
+    NSMutableDictionary *targets=[NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *,id<MTLBuffer>> *targetData=[NSMutableDictionary dictionary];
+    for (NSUInteger slot=0; slot<4 && frameGBuffer; ++slot) {
+        id<MTLTexture> t=frameGBuffer(slot);
+        if (!t) continue;
+        NSUInteger bytes=0;
+        switch (t.pixelFormat) {
+            case MTLPixelFormatR16Float: bytes=2; break;
+            case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm:
+            case MTLPixelFormatRG16Snorm: case MTLPixelFormatRG16Float: case MTLPixelFormatR32Float:
+            case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRG11B10Float: bytes=4; break;
+            case MTLPixelFormatRGBA16Float: bytes=8; break;
+            default: break;
+        }
+        NSString *key=[NSString stringWithFormat:@"gbuffer-%lu",(unsigned long)slot];
+        targets[key]=@{@"format":@(t.pixelFormat),@"width":@(t.width),@"height":@(t.height),@"bytesPerPixel":@(bytes)};
+        if (!bytes || t.textureType!=MTLTextureType2D || t.sampleCount!=1 || t.storageMode==MTLStorageModeMemoryless ||
+            t.device.registryID!=color.device.registryID) continue;
+        id<MTLBuffer> data=[color.device newBufferWithLength:t.width*bytes*t.height options:MTLResourceStorageModeShared];
+        if (!data) continue;
+        [blit copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:MTLSizeMake(t.width,t.height,1) toBuffer:data destinationOffset:0 destinationBytesPerRow:t.width*bytes destinationBytesPerImage:data.length];
+        targetData[key]=data;
+    }
+    [blit endEncoding];
+    NSDictionary *info=@{@"targets":targets,@"normalsWidth":@(n ? normals.width : 0),@"normalsHeight":@(n ? normals.height : 0),@"normalsStride":@(n ? ns : 0),@"colorWidth":@(color.width),@"colorHeight":@(color.height),@"colorStride":@(cs),
+        @"depthWidth":@(depth.width),@"depthHeight":@(depth.height),@"depthStride":@(ds),@"previousDepth":@(c!=nil)};
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.status!=MTLCommandBufferStatusCompleted) { Log(@"Alignment capture failed; nothing written."); return; }
+        NSString *folder=[directory stringByAppendingPathComponent:@"align-capture"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
+        // An optional file left by an earlier capture would belong to another frame.
+        NSMutableArray<NSString *> *stale=[NSMutableArray array];
+        if (!n) [stale addObject:@"normals.rg16s"];
+        if (!c) [stale addObject:@"depth-previous.r32f"];
+        for (NSUInteger slot=0; slot<4; ++slot) {
+            NSString *key=[NSString stringWithFormat:@"gbuffer-%lu",(unsigned long)slot];
+            if (!targetData[key]) [stale addObject:[key stringByAppendingString:@".bin"]];
+        }
+        for (NSString *name in stale) [[NSFileManager defaultManager] removeItemAtPath:[folder stringByAppendingPathComponent:name] error:nil];
+        [[NSData dataWithBytesNoCopy:a.contents length:a.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"color.rgba16f"] atomically:YES];
+        [[NSData dataWithBytesNoCopy:b.contents length:b.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"depth.r32f"] atomically:YES];
+        if (n) [[NSData dataWithBytesNoCopy:n.contents length:n.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"normals.rg16s"] atomically:YES];
+        for (NSString *key in targetData) [[NSData dataWithBytesNoCopy:targetData[key].contents length:targetData[key].length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:[key stringByAppendingString:@".bin"]] atomically:YES];
+        if (c) [[NSData dataWithBytesNoCopy:c.contents length:c.length freeWhenDone:NO] writeToFile:[folder stringByAppendingPathComponent:@"depth-previous.r32f"] atomically:YES];
+        [[NSJSONSerialization dataWithJSONObject:info options:NSJSONWritingPrettyPrinted error:nil] writeToFile:[folder stringByAppendingPathComponent:@"capture.json"] atomically:YES];
+        Log(@"Alignment capture written to align-capture.");
+    }];
+}
+// Arms a capture when the request file exists, and removes the file.
+static void CheckCaptureRequest(void) {
+    NSString *request=[directory stringByAppendingPathComponent:@"capture-request"];
+    NSFileManager *files=[NSFileManager defaultManager];
+    BOOL folder=NO;
+    if (![files fileExistsAtPath:request isDirectory:&folder] || folder || ![files removeItemAtPath:request error:nil]) return;
+    [lock lock]; captureRequested=YES; [lock unlock];
 }
 static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth) {
     @autoreleasepool {
@@ -249,35 +407,80 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
 
         ShaderSettings settings=p.settings;
         settings.texel=(simd_float2){1.f/color.width,1.f/color.height};
-        settings.depthTexel=(simd_float2){1.f/depth.width,1.f/depth.height};
+        // Mip 0 of the hierarchy is the only depth the shaders read. Halve a
+        // guest depth buffer wider than 1920, so the trace and the hierarchy
+        // build cost the same at every guest resolution scale.
+        NSUInteger hw=depth.width, hh=depth.height;
+        while (hw>1920) { hw=(hw+1)/2; hh=(hh+1)/2; }
+        settings.depthTexel=(simd_float2){1.f/hw,1.f/hh};
         settings.aspect=(float)depth.width/depth.height;
         settings.depthAvailable=freshDepth ? 1.f : 0.f;
-        NSUInteger ew=MIN(p.effectWidth,depth.width), eh=MAX(1,(NSUInteger)round(ew/settings.aspect));
+        NSUInteger effectWidth=p.effectWidth;
+        // Low Power Mode and thermal pressure shrink the effect buffers.
+        if (reducedPower && p.adaptivePower) effectWidth=MAX(480,effectWidth*3/4);
+        NSUInteger ew=MIN(effectWidth,depth.width), eh=MAX(1,(NSUInteger)round(ew/settings.aspect));
         NSUInteger bw=MAX(1,ew/2), bh=MAX(1,eh/2);
         ShaderFrame *frame=nil;
-        for (ShaderFrame *candidate in p.frames) if (!candidate.busy) { frame=candidate; break; }
-        if (!frame && p.frames.count<4) { frame=[ShaderFrame new]; [p.frames addObject:frame]; }
+        ShaderFrame *previous=heldFrame;
+        heldFrame=nil;
+        id<MTLTexture> guestNormals=p.gameNormals && freshDepth && frameNormals ? frameNormals() : nil;
+        if (!UsableNormals(guestNormals,depth,p.device)) guestNormals=nil;
+        // The base-color target of the same pass; its alpha holds the material.
+        id<MTLTexture> guestMaterial=nil;
+        for (NSUInteger slot=0; slot<4 && guestNormals && p.gameMaterials && frameGBuffer && !guestMaterial; ++slot) {
+            id<MTLTexture> candidate=frameGBuffer(slot);
+            if (candidate.pixelFormat==MTLPixelFormatRGBA8Unorm && UsableTarget(candidate,depth,p.device)) guestMaterial=candidate;
+        }
+        BOOL capture=captureRequested && freshDepth;
+        if (capture) captureRequested=NO;
+        for (ShaderFrame *candidate in p.frames) if (!candidate.busy && candidate!=previous) { frame=candidate; break; }
+        if (!frame && p.frames.count<5) { frame=[ShaderFrame new]; [p.frames addObject:frame]; }
         if (!frame) { skippedFrames++; [lock unlock]; return; }
         frame.busy=YES;
         [lock unlock];
-        if (frame.color.width!=color.width || frame.color.height!=color.height || frame.effects.width!=ew || frame.effects.height!=eh) {
-            frame.color=Texture(p.device,color.width,color.height,@"SMO frame copy");
-            frame.effects=Texture(p.device,ew,eh,@"SMO bounce and contact shadows");
-            frame.reflections=Texture(p.device,ew,eh,@"SMO reflection radiance and confidence");
+        if (frame.effects.width!=ew || frame.effects.height!=eh) {
+            frame.low=Texture(p.device,MAX(1,ew/2),MAX(1,eh/2),@"SMO half-size surface effects");
+            frame.surface=Texture(p.device,ew,eh,@"SMO surface effects");
+            frame.effects=Texture(p.device,ew,eh,@"SMO resolved effects");
             frame.bloomA=Texture(p.device,bw,bh,@"SMO bloom A");
             frame.bloomB=Texture(p.device,bw,bh,@"SMO bloom B");
         }
         // Depth can resize without a change to output size or the effect-width limit.
         BOOL hierarchyReady=YES;
-        if (frame.depthHierarchy.width!=depth.width || frame.depthHierarchy.height!=depth.height) {
-            hierarchyReady=AllocateHierarchy(frame,p.device,depth.width,depth.height);
+        if (frame.depthHierarchy.width!=hw || frame.depthHierarchy.height!=hh) {
+            hierarchyReady=AllocateHierarchy(frame,p.device,hw,hh);
         }
-        if (!frame.color || !frame.effects || !frame.reflections || !frame.bloomA || !frame.bloomB ||
+        if (frame.normals.width!=hw || frame.normals.height!=hh) {
+            MTLTextureDescriptor *nd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGB10A2Unorm width:hw height:hh mipmapped:NO];
+            nd.storageMode=MTLStorageModePrivate;
+            nd.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;
+            frame.normals=[p.device newTextureWithDescriptor:nd];
+            frame.normals.label=@"SMO view-space normals";
+            // A zeroed buffer is an invalid fit.
+            if (!frame.normalFit) frame.normalFit=[p.device newBufferWithLength:NormalFitBytes*(1+NormalFitRows) options:MTLResourceStorageModeShared];
+            frame.hasNormals=NO;
+        }
+        if (!frame.normals || !frame.normalFit) hierarchyReady=NO;
+        if (!frame.low || !frame.surface || !frame.effects || !frame.bloomA || !frame.bloomB ||
             !hierarchyReady || !frame.depthHierarchy || frame.hierarchyMips.count!=frame.depthHierarchy.mipmapLevelCount) {
             [lock lock]; frame.busy=NO; p.failed=YES; lastError=@"Metal texture allocation failed"; [lock unlock];
             Log(lastError); return;
         }
-        settings.hierarchyLevels=freshDepth ? (float)frame.depthHierarchy.mipmapLevelCount : 0.f;
+        if (freshDepth) { [lock lock]; heldFrame=frame; [lock unlock]; }
+        // Live captures show that the guest depth at a present is one present
+        // ahead of the presented color. depthDelay 1 therefore reads the
+        // hierarchy that the previous present built, which matches the color.
+        // That command buffer precedes this one on the queue.
+        BOOL previousUsable=previous.depthHierarchy.width==hw && previous.depthHierarchy.height==hh;
+        BOOL delayed=p.depthDelay>0;
+        id<MTLTexture> hierarchy=delayed && previousUsable ? previous.depthHierarchy : frame.depthHierarchy;
+        BOOL usable=delayed ? previousUsable : freshDepth;
+        settings.depthAvailable=usable ? 1.f : 0.f;
+        settings.hierarchyLevels=usable ? (float)hierarchy.mipmapLevelCount : 0.f;
+        ShaderFrame *source=delayed && previousUsable ? previous : frame;
+        if (freshDepth) { frame.hasNormals=guestNormals!=nil; frame.hasMaterials=guestMaterial!=nil; }
+        id<MTLTexture> normals=source.normals;
+        settings.normalsAvailable=usable && source.hasNormals && p.gameNormals ? (source.hasMaterials && p.gameMaterials ? 2.f : 1.f) : 0.f;
         // Keep the slot reserved even if an encoder fails after commands were encoded.
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
             [lock lock];
@@ -287,29 +490,59 @@ static void ProcessFrame(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTe
             presentCBMilliseconds=frameCount==1 ? ms : presentCBMilliseconds*.95+ms*.05;
             if (done.error) { errorCount++; p.failed=YES; lastError=done.error.description; Log(lastError); }
             // This duration covers the complete presentation command buffer, including guest work.
-            if (frameCount==1 || frameCount%1800==0) Log([NSString stringWithFormat:@"frames=%llu presentCBms=%.3f errors=%llu skipped=%llu missingDepth=%llu",frameCount,presentCBMilliseconds,errorCount,skippedFrames,missingDepthFrames]);
+            if (frameCount==1 || frameCount==300 || frameCount%1800==0) {
+                const float *fit=frame.normalFit.contents;
+                Log([NSString stringWithFormat:@"frames=%llu presentCBms=%.3f errors=%llu skipped=%llu missingDepth=%llu gameNormals=%d gameMaterials=%d fit=%.3f",frameCount,presentCBMilliseconds,errorCount,skippedFrames,missingDepthFrames,frame.hasNormals,frame.hasMaterials,frame.hasNormals ? fit[14] : 0]);
+            }
             [lock unlock];
         }];
-        id<MTLBlitCommandEncoder> blit=[cb blitCommandEncoder];
-        if (!blit) { EncodingFailed(p,@"Metal color-copy encoder creation failed"); return; }
-        blit.label=@"SMO HDR scene copy";
-        [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(color.width,color.height,1) toTexture:frame.color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
-        [blit endEncoding];
+        // The passes sample the drawable directly, and the composite reads it
+        // in place, so no copy of the frame exists.
+        BOOL debug=settings.debugView>.5f;
         if (freshDepth && !BuildHierarchy(cb,p,frame,depth)) {
             EncodingFailed(p,@"Metal depth-hierarchy encoder creation failed"); return;
         }
-        if (!Draw(cb,frame.effects,frame.reflections,p.surface,@[frame.color,depth,frame.depthHierarchy],settings) ||
-            !Draw(cb,frame.bloomA,nil,p.extract,@[frame.color],settings)) {
-            EncodingFailed(p,@"Metal surface or bloom encoder creation failed"); return;
+        if (guestNormals && !BuildNormals(cb,p,frame,previous,guestNormals,guestMaterial,depth,&settings)) {
+            EncodingFailed(p,@"Metal normal encoder creation failed"); return;
         }
-        settings.direction=(simd_float2){2.f/bw,0};
-        if (!Draw(cb,frame.bloomB,nil,p.blur,@[frame.bloomA],settings)) {
-            EncodingFailed(p,@"Metal horizontal bloom encoder creation failed"); return;
+        if (capture) EncodeCapture(cb,color,frame.hierarchyMips[0],previousUsable ? previous.hierarchyMips[0] : nil,guestNormals);
+        if (usable || debug) {
+            BOOL drawn;
+            if (p.halfResolution && !debug) {
+                // Occlusion and rough reflections at half size, mirror-like
+                // reflections at full size. The resolve pass joins them.
+                settings.surfaceMode=1;
+                drawn=Draw(cb,frame.low,MTLLoadActionDontCare,p.surface,color,hierarchy,normals,&settings);
+                settings.surfaceMode=2;
+                drawn=drawn && Draw(cb,frame.surface,MTLLoadActionDontCare,p.surface,color,hierarchy,normals,&settings);
+                settings.surfaceMode=1;
+                settings.direction=(simd_float2){1.f/frame.low.width,1.f/frame.low.height};
+                drawn=drawn && Draw(cb,frame.effects,MTLLoadActionDontCare,p.resolve,frame.low,hierarchy,frame.surface,&settings);
+            } else {
+                settings.surfaceMode=0;
+                settings.direction=(simd_float2){1.f/ew,1.f/eh};
+                drawn=Draw(cb,frame.surface,MTLLoadActionDontCare,p.surface,color,hierarchy,normals,&settings) &&
+                    Draw(cb,frame.effects,MTLLoadActionDontCare,p.resolve,frame.surface,hierarchy,frame.surface,&settings);
+            }
+            if (!drawn) { EncodingFailed(p,@"Metal surface encoder creation failed"); return; }
         }
-        settings.direction=(simd_float2){0,2.f/bh};
-        if (!Draw(cb,frame.bloomA,nil,p.blur,@[frame.bloomB],settings) ||
-            !Draw(cb,color,nil,p.composite,@[frame.color,frame.effects,frame.bloomA,frame.reflections],settings)) {
-            EncodingFailed(p,@"Metal vertical bloom or composite encoder creation failed"); return;
+        if (settings.bloom>0 && !debug) {
+            if (!Draw(cb,frame.bloomA,MTLLoadActionDontCare,p.extract,color,nil,nil,&settings)) {
+                EncodingFailed(p,@"Metal bloom encoder creation failed"); return;
+            }
+            settings.direction=(simd_float2){2.f/bw,0};
+            if (!Draw(cb,frame.bloomB,MTLLoadActionDontCare,p.blur,frame.bloomA,nil,nil,&settings)) {
+                EncodingFailed(p,@"Metal horizontal bloom encoder creation failed"); return;
+            }
+            settings.direction=(simd_float2){0,2.f/bh};
+            if (!Draw(cb,frame.bloomA,MTLLoadActionDontCare,p.blur,frame.bloomB,nil,nil,&settings)) {
+                EncodingFailed(p,@"Metal vertical bloom encoder creation failed"); return;
+            }
+        }
+        // The composite samples the effects only on a frame with usable depth.
+        settings.depthAvailable=usable || debug ? 1.f : 0.f;
+        if (!Draw(cb,color,MTLLoadActionLoad,p.composite,frame.effects,frame.bloomA,nil,&settings)) {
+            EncodingFailed(p,@"Metal composite encoder creation failed"); return;
         }
     }
 }
@@ -326,6 +559,10 @@ __attribute__((visibility("default"))) void SMOShadersReload(void) {
 }
 
 #ifdef SMO_COMPILE_ONLY
+static id<MTLTexture> testNormals;
+static id<MTLTexture> TestNormals(void) { return testNormals; }
+static id<MTLTexture> testMaterial;
+static id<MTLTexture> TestGBuffer(NSUInteger slot) { return slot==3 ? testMaterial : nil; }
 int main(int argc, const char **argv) {
     @autoreleasepool {
         directory=argc>1 ? @(argv[1]) : @".";
@@ -350,9 +587,38 @@ int main(int argc, const char **argv) {
         id<MTLTexture> depth=[device newTextureWithDescriptor:dd];
         id<MTLCommandBuffer> cb=[queue commandBuffer];
         id<MTLBlitCommandEncoder> blit=[cb blitCommandEncoder];
+        // A capture can include the game's normal target.
+        NSData *normalData=[NSData dataWithContentsOfFile:[captureDir stringByAppendingPathComponent:@"normals.rg16s"]];
+        NSUInteger ns=[info[@"normalsStride"] unsignedIntegerValue];
+        if (ns && [info[@"normalsWidth"] unsignedIntegerValue]==dw && normalData.length==ns*dh) {
+            MTLTextureDescriptor *nd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Snorm width:dw height:dh mipmapped:NO];
+            nd.storageMode=MTLStorageModePrivate;
+            testNormals=[device newTextureWithDescriptor:nd];
+            id<MTLBuffer> normalBuffer=[device newBufferWithBytes:normalData.bytes length:normalData.length options:MTLResourceStorageModeShared];
+            [blit copyFromBuffer:normalBuffer sourceOffset:0 sourceBytesPerRow:ns sourceBytesPerImage:ns*dh sourceSize:MTLSizeMake(dw,dh,1) toTexture:testNormals destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+            frameNormals=TestNormals;
+            // gbuffer-3.bin is the game's base-color target, tightly packed.
+            NSData *materialData=[NSData dataWithContentsOfFile:[captureDir stringByAppendingPathComponent:@"gbuffer-3.bin"]];
+            if (materialData.length==dw*4*dh) {
+                MTLTextureDescriptor *md=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:dw height:dh mipmapped:NO];
+                md.storageMode=MTLStorageModePrivate;
+                testMaterial=[device newTextureWithDescriptor:md];
+                id<MTLBuffer> materialBuffer=[device newBufferWithBytes:materialData.bytes length:materialData.length options:MTLResourceStorageModeShared];
+                [blit copyFromBuffer:materialBuffer sourceOffset:0 sourceBytesPerRow:dw*4 sourceBytesPerImage:dw*4*dh sourceSize:MTLSizeMake(dw,dh,1) toTexture:testMaterial destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                frameGBuffer=TestGBuffer;
+            }
+        }
         [blit copyFromBuffer:colorBuffer sourceOffset:0 sourceBytesPerRow:cs sourceBytesPerImage:cs*ch sourceSize:MTLSizeMake(cw,ch,1) toTexture:color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
         [blit copyFromBuffer:depthBuffer sourceOffset:0 sourceBytesPerRow:ds sourceBytesPerImage:ds*dh sourceSize:MTLSizeMake(dw,dh,1) toTexture:depth destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
         [blit endEncoding];
+        // With depthDelay 1 the first present only builds the hierarchy, so
+        // process the frame once and upload the color again.
+        ProcessFrame(cb,color,depth);
+        blit=[cb blitCommandEncoder];
+        [blit copyFromBuffer:colorBuffer sourceOffset:0 sourceBytesPerRow:cs sourceBytesPerImage:cs*ch sourceSize:MTLSizeMake(cw,ch,1) toTexture:color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+        [blit endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        cb=[queue commandBuffer];
         ProcessFrame(cb,color,depth);
         blit=[cb blitCommandEncoder];
         [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(cw,ch,1) toBuffer:colorBuffer destinationOffset:0 destinationBytesPerRow:cs destinationBytesPerImage:cs*ch];
@@ -360,7 +626,33 @@ int main(int argc, const char **argv) {
         [cb commit]; [cb waitUntilCompleted];
         printf("%s\n",SMOShadersStatus());
         if (cb.error) return 3;
+        for (ShaderFrame *f in program.frames) if (f.hasNormals) {
+            float *fit=f.normalFit.contents;
+            printf("normalFit valid=%g weight=%.0f agreement=%.4f\n",fit[12],fit[13],fit[14]);
+        }
         if (argc>3) [[NSData dataWithBytes:colorBuffer.contents length:colorBuffer.length] writeToFile:@(argv[3]) atomically:YES];
+        // Optional fourth argument: frame count for a GPU time measurement.
+        // Each frame restores the captured color in an untimed command buffer.
+        int frames=argc>4 ? atoi(argv[4]) : 0;
+        if (frames>0) {
+            id<MTLBuffer> pristine=[device newBufferWithBytes:colorData.bytes length:colorData.length options:MTLResourceStorageModeShared];
+            double total=0, best=1e9;
+            for (int i=0;i<frames;i++) {
+                if (i==frames/2) CheckCaptureRequest();
+                cb=[queue commandBuffer];
+                blit=[cb blitCommandEncoder];
+                [blit copyFromBuffer:pristine sourceOffset:0 sourceBytesPerRow:cs sourceBytesPerImage:cs*ch sourceSize:MTLSizeMake(cw,ch,1) toTexture:color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                [blit endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                cb=[queue commandBuffer];
+                ProcessFrame(cb,color,depth);
+                [cb commit]; [cb waitUntilCompleted];
+                if (cb.error) return 3;
+                double ms=(cb.GPUEndTime-cb.GPUStartTime)*1000;
+                total+=ms; if (ms<best) best=ms;
+            }
+            printf("benchmark frames=%d averageGpuMs=%.3f bestGpuMs=%.3f\n",frames,total/frames,best);
+        }
         return 0;
     }
 }
@@ -375,12 +667,22 @@ __attribute__((constructor)) static void Install(void) {
         void (*setProcessor)(FrameProcessor)=dlsym(RTLD_DEFAULT,"SMOSetFrameProcessor");
         if (!setProcessor) { Log(@"Metal bridge is not loaded."); return; }
         if (!LoadProgram()) return;
+        SettingsChanged();
+        frameNormals=dlsym(RTLD_DEFAULT,"SMOFrameNormals");
+        frameGBuffer=dlsym(RTLD_DEFAULT,"SMOFrameGBuffer");
+        if (!frameNormals) Log(@"This Metal bridge does not provide the game's normals.");
         setProcessor(ProcessFrame);
         timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
-        dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),NSEC_PER_SEC,NSEC_PER_SEC/4);
+        dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),NSEC_PER_SEC,NSEC_PER_SEC/2);
         dispatch_source_set_event_handler(timer,^{
-            NSDictionary *settings=ReadSettings();
-            [lock lock]; UpdateSettings(program,settings); [lock unlock];
+            NSProcessInfo *process=NSProcessInfo.processInfo;
+            BOOL reduced=process.thermalState>=NSProcessInfoThermalStateSerious || process.lowPowerModeEnabled;
+            NSDictionary *settings=SettingsChanged() ? ReadSettings() : nil;
+            CheckCaptureRequest();
+            [lock lock];
+            reducedPower=reduced;
+            if (settings) UpdateSettings(program,settings);
+            [lock unlock];
             dispatch_async(dispatch_get_main_queue(),^{
                 BOOL isOdyssey=NO;
                 for (NSWindow *window in NSApp.windows) {

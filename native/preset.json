@@ -8,6 +8,11 @@
   "contrast": 1.055,
   "verticalFov": 50.0,
   "effectWidth": 1280,
+  "depthDelay": 1,
+  "gameNormals": true,
+  "gameMaterials": true,
+  "halfResolution": true,
+  "adaptivePower": true,
   "debugView": 0,
   "debugMip": 0
 }

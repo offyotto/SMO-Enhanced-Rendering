@@ -8,7 +8,10 @@
 typedef void (*FrameProcessor)(id<MTLCommandBuffer>, id<MTLTexture>, id<MTLTexture>);
 static FrameProcessor processor;
 static id<CAMetalDrawable> currentDrawable;
-static id<MTLTexture> currentDepth;
+static id<MTLTexture> currentDepth, currentNormals, frameNormals;
+// Every color target of the pass that wrote the normals.
+static id<MTLTexture> currentGBuffer[4], frameGBuffer[4];
+static uint64_t normalsSerial;
 static uint64_t depthSerial, frameSerial, commits, presents, draws;
 static NSUInteger depthArea;
 static os_unfair_lock stateLock = OS_UNFAIR_LOCK_INIT;
@@ -16,6 +19,20 @@ static FILE *logFile;
 static IMP originalNext, originalRender, originalCommit;
 static NSMutableSet<NSString *> *seenDepths, *seenColors, *seenLabels;
 static _Thread_local BOOL insideProcessor;
+
+// Tags of the attachments whose signature was already formatted.
+static uintptr_t seenColorTags[512], seenDepthTags[256];
+static NSUInteger seenColorTagCount, seenDepthTagCount;
+
+// Returns YES for a recorded tag. Records a new one while space remains;
+// after that every tag counts as recorded.
+static BOOL Known(uintptr_t *tags, NSUInteger *count, uintptr_t tag) {
+    NSUInteger capacity=tags==seenColorTags ? 512 : 256;
+    for (NSUInteger i=0; i<*count; i++) if (tags[i]==tag) return YES;
+    if (*count==capacity) return YES;
+    tags[(*count)++]=tag;
+    return NO;
+}
 
 static void Log(NSString *message) {
     if (logFile) { fprintf(logFile, "%s\n", message.UTF8String); fflush(logFile); }
@@ -51,10 +68,14 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
         // eventually appear here because MoltenVK maps guest render targets to
         // Metal render-pass color attachments. We deliberately do not retain,
         // modify, or force-store anything yet; this first stage is observation.
-        for (NSUInteger i=0; i<8; ++i) {
+        // This hook runs for every guest render pass. Format a signature only
+        // for a texture that the log has not recorded, and stop reading the
+        // attachments once the log is full.
+        for (NSUInteger i=0; i<8 && seenColors.count < 240; ++i) {
             MTLRenderPassColorAttachmentDescriptor *att=desc.colorAttachments[i];
             id<MTLTexture> tex=att.texture;
             if (!tex || tex.width < 160 || tex.height < 90) continue;
+            if (Known(seenColorTags,&seenColorTagCount,(uintptr_t)(__bridge void *)tex ^ i ^ att.loadAction<<4 ^ att.storeAction<<8)) continue;
             id<MTLTexture> resolve=att.resolveTexture;
             NSString *key=[NSString stringWithFormat:
                 @"slot=%lu %lux%lu fmt=%lu type=%lu samples=%lu usage=%lu storage=%lu load=%lu store=%lu resolve=%lux%lu rfmt=%lu label=%@",
@@ -75,8 +96,22 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
         id<MTLTexture> tex = desc.depthAttachment.texture;
         if (tex && tex.width >= 320 && tex.height >= 180) {
             draws++;
+            if (!Known(seenDepthTags,&seenDepthTagCount,(uintptr_t)(__bridge void *)tex ^ desc.depthAttachment.loadAction<<4 ^ desc.depthAttachment.storeAction<<8)) {
             NSString *key = [NSString stringWithFormat:@"%p %lux%lu fmt=%lu type=%lu samples=%lu usage=%lu storage=%lu load=%lu store=%lu clear=%.9g label=%@", (__bridge void *)tex, tex.width, tex.height, tex.pixelFormat, tex.textureType, tex.sampleCount, tex.usage, tex.storageMode, desc.depthAttachment.loadAction, desc.depthAttachment.storeAction, desc.depthAttachment.clearDepth, tex.label];
             if (seenDepths.count < 120 && ![seenDepths containsObject:key]) { [seenDepths addObject:key]; Log([@"depth " stringByAppendingString:key]); }
+            }
+            // The G-buffer pass writes world-space normals to an RG16Snorm
+            // target the size of its depth buffer.
+            for (NSUInteger i=0; i<4; ++i) {
+                id<MTLTexture> candidate=desc.colorAttachments[i].texture;
+                if (candidate && candidate.pixelFormat==MTLPixelFormatRG16Snorm && candidate.width==tex.width &&
+                    candidate.height==tex.height && candidate.sampleCount==1) {
+                    currentNormals=candidate;
+                    normalsSerial=frameSerial;
+                    for (NSUInteger slot=0; slot<4; ++slot) currentGBuffer[slot]=desc.colorAttachments[slot].texture;
+                    break;
+                }
+            }
             float aspect = (float)tex.width / tex.height;
             if (tex.sampleCount == 1 && aspect > 1.70 && aspect < 1.85 && tex.width >= 640 && tex.width*tex.height >= depthArea) {
                 currentDepth = tex;
@@ -92,7 +127,7 @@ static id<MTLRenderCommandEncoder> Render(id<MTLCommandBuffer> cb, SEL sel, MTLR
 static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
     NSString *label = cb.label ?: @"<no label>";
     id<CAMetalDrawable> drawable = nil;
-    id<MTLTexture> depth = nil;
+    id<MTLTexture> depth = nil, normals = nil, gbuffer[4] = {nil};
     FrameProcessor effect = NULL;
     os_unfair_lock_lock(&stateLock);
     commits++;
@@ -101,6 +136,10 @@ static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
         presents++;
         drawable = currentDrawable;
         depth = depthSerial == frameSerial ? currentDepth : nil;
+        if (depth && normalsSerial == frameSerial && currentNormals.width == depth.width && currentNormals.height == depth.height) {
+            normals = currentNormals;
+            for (NSUInteger slot=0; slot<4; ++slot) gbuffer[slot]=currentGBuffer[slot];
+        }
         effect = processor;
         frameSerial++;
         depthArea=0;
@@ -109,7 +148,11 @@ static void Commit(id<MTLCommandBuffer> cb, SEL sel) {
     os_unfair_lock_unlock(&stateLock);
     if (effect && drawable && !drawable.texture.framebufferOnly) {
         insideProcessor = YES;
+        frameNormals = normals;
+        for (NSUInteger slot=0; slot<4; ++slot) frameGBuffer[slot]=gbuffer[slot];
         effect(cb, drawable.texture, depth);
+        frameNormals = nil;
+        for (NSUInteger slot=0; slot<4; ++slot) frameGBuffer[slot]=nil;
         insideProcessor = NO;
     }
     ((void (*)(id, SEL))originalCommit)(cb, sel);
@@ -120,6 +163,18 @@ __attribute__((visibility("default"))) void SMOSetFrameProcessor(FrameProcessor 
     processor = callback;
     os_unfair_lock_unlock(&stateLock);
     Log(callback ? @"frame processor enabled" : @"frame processor disabled");
+}
+
+// The G-buffer normal target of the frame being presented. Valid only inside
+// the frame processor.
+__attribute__((visibility("default"))) id<MTLTexture> SMOFrameNormals(void) {
+    return insideProcessor ? frameNormals : nil;
+}
+
+// A color target of the G-buffer pass of the frame being presented. Valid
+// only inside the frame processor.
+__attribute__((visibility("default"))) id<MTLTexture> SMOFrameGBuffer(NSUInteger slot) {
+    return insideProcessor && slot<4 ? frameGBuffer[slot] : nil;
 }
 
 __attribute__((visibility("default"))) const char *SMOBridgeStatus(void) {

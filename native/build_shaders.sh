@@ -18,5 +18,11 @@ clang "${COMMON[@]}" \
   -framework Foundation \
   ShaderLoader.m -o libSMOShaderLoader.dylib
 
+# Offline check and benchmark. See README.md.
+clang -fobjc-arc -O2 -mmacosx-version-min=15.0 -DSMO_COMPILE_ONLY \
+  -framework Foundation -framework Metal -framework AppKit -framework QuartzCore \
+  Cinematic.m -o cinematic-test
+./cinematic-test .
+
 echo "Built:"
 ls -lh libSMOCinematic.dylib libSMOMetalBridge.dylib libSMOShaderLoader.dylib
