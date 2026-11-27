@@ -92,7 +92,12 @@ static NSDictionary *ReadSettings(void) {
 // The preset is polled once per second. Parse it only after it changes.
 static BOOL SettingsChanged(void) {
     struct stat info;
-    if (stat([[directory stringByAppendingPathComponent:@"preset.json"] fileSystemRepresentation],&info)) return NO;
+    if (stat([[directory stringByAppendingPathComponent:@"preset.json"] fileSystemRepresentation],&info)) {
+        // A removed preset restores the defaults once.
+        BOOL existed=settingsSize!=-1;
+        settingsSize=-1;
+        return existed;
+    }
     if (info.st_size==settingsSize && info.st_ino==settingsFile && info.st_mtimespec.tv_sec==settingsTime.tv_sec && info.st_mtimespec.tv_nsec==settingsTime.tv_nsec) return NO;
     settingsSize=info.st_size; settingsFile=info.st_ino; settingsTime=info.st_mtimespec;
     return YES;
